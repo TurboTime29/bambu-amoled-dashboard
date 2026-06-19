@@ -5,7 +5,13 @@ A round, Apple-esque dashboard for **Bambu Lab 3D printers**, running on the
 [ESPHome](https://esphome.io) + LVGL. It pulls live print data from **Home
 Assistant** and is designed to be OLED-safe (no static burn-in elements).
 
-<!-- Add a screenshot/photo here once you have one, e.g. ![dashboard](docs/preview.jpg) -->
+<img width="300" height="300" alt="Main Screen" src="https://github.com/user-attachments/assets/7b6f8e75-d252-4c75-96f3-f48dce0b7111" />
+<img width="300" height="300" alt="AMS Screen" src="https://github.com/user-attachments/assets/1b6457d1-b87f-4b10-9f24-9a2fe62cf5af" />
+<img width="300" height="300" alt="Restart/Battery/Brightness Screen" src="https://github.com/user-attachments/assets/81ccb0f8-ee88-4ff1-944f-e992d8d5de5d" />
+
+
+
+
 
 ## Features
 
