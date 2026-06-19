@@ -42,6 +42,16 @@ Assistant** and is designed to be OLED-safe (no static burn-in elements).
   - PMU: AXP2101 (battery/charging)
 - A 2.4 GHz Wi-Fi network
 - Optional: a LiPo battery (JST) for cordless use
+- A printed case — see below
+
+## Case / enclosure
+
+This project was inspired by, and is built into, the **PrintSphere – Bambu
+Status Display (Standalone) 1.75** model on MakerWorld. That's the printed
+body used for the build shown above — print it and mount the Waveshare board
+inside:
+
+➡️ <https://makerworld.com/en/models/2517189-printsphere-bambu-status-display-standalone-1-75>
 
 ## Prerequisites
 
@@ -176,6 +186,7 @@ release — open an issue if you'd like guidance.
 - Built with [ESPHome](https://esphome.io) and [LVGL](https://lvgl.io).
 - Printer data via the [Home Assistant Bambu Lab integration](https://github.com/greghesp/ha-bambulab).
 - Hardware: [Waveshare ESP32-S3-Touch-AMOLED-1.75](https://www.waveshare.com/wiki/ESP32-S3-Touch-AMOLED-1.75).
+- Case & inspiration: [PrintSphere – Bambu Status Display (Standalone) 1.75](https://makerworld.com/en/models/2517189-printsphere-bambu-status-display-standalone-1-75) on MakerWorld.
 
 ## License
 
