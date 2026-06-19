@@ -1,0 +1,2588 @@
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  BAMBU LAB AMOLED DASHBOARD  ·  Apple-esque round dashboard            ║
+# ║  Waveshare ESP32-S3-Touch-AMOLED-1.75  ·  CO5300 QSPI  ·  466×466     ║
+# ║                                                                          ║
+# ║  A round, OLED-safe dashboard for a Bambu Lab printer, driven from      ║
+# ║  Home Assistant. See README.md for setup. Configure the four           ║
+# ║  substitutions below to match YOUR HA entity names — that's all most    ║
+# ║  users need to change.                                                  ║
+# ║                                                                          ║
+# ║  HARDWARE:                                                              ║
+# ║    Display: CO5300, QSPI bus_mode:quad, GPIO38/4/5/6/7, CS=12, RST=39  ║
+# ║    Touch:   CST9217, I2C SDA=15 SCL=14, INT=11, RST=40                 ║
+# ║    PMU:     AXP2101, I2C 0x34 — battery SOC via reg 0xA4, VBUS reg 0x00 ║
+# ║    MCU:     ESP32-S3R8, 8MB PSRAM (octal 80MHz), 16MB flash            ║
+# ║                                                                          ║
+# ║  NAVIGATION (swipe):                                                    ║
+# ║    ← / →  paginate between Home and AMS                                 ║
+# ║    ↑      open Settings (battery · brightness · restart)               ║
+# ║    ↓      open Screensaver; swipe ↓ again on it to deep-sleep          ║
+# ║    Inside a drawer, swipe the opposite way to return.                   ║
+# ║                                                                          ║
+# ║  PAGES:                                                                 ║
+# ║    page_home       — Adaptive watch face (idle) / live print progress  ║
+# ║    page_ams        — Combined AMS + AMS HT spool view                  ║
+# ║    page_control    — Battery · Brightness · Restart (the "Settings")   ║
+# ║    page_screensaver— Twinkling stars + shooting stars (OLED-safe)      ║
+# ║                                                                          ║
+# ║  SECRETS REQUIRED (secrets.yaml — see secrets.yaml.example):           ║
+# ║    wifi_ssid, wifi_password                                             ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+esphome:
+  name: ${device_name}
+  friendly_name: ${printer_name} Dashboard
+  min_version: "2026.4.0"   # Requires LVGL v9 + named CO5300 model support
+  platformio_options:
+    board_build.flash_mode: dio
+    board_build.f_flash: 80000000L
+    board_build.f_cpu: 240000000L  # Full speed — LVGL needs it for smooth rendering
+  on_boot:
+    priority: -100
+    then:
+      # Configure the AXP2101 charger for faster charging (2200 mAh cell):
+      #   reg 0x16 (VBUS input current limit) → 2000 mA so the panel/ESP32 load
+      #     stops starving the charger (default ~500 mA was the slow-charge cause).
+      #   reg 0x62 (constant-current charge limit) → 1000 mA (chip max, ~0.45C).
+      #   reg 0x30 bit0 → enable the Vbat ADC so we can read battery voltage.
+      - lambda: |-
+          if (auto v = id(axp2101_dev).read_byte(0x16))
+            id(axp2101_dev).write_byte(0x16, (uint8_t)((v.value() & ~0x07) | 0x05));  // 2000mA
+          if (auto v = id(axp2101_dev).read_byte(0x62))
+            id(axp2101_dev).write_byte(0x62, (uint8_t)((v.value() & ~0x1F) | 0x10));  // 1000mA
+          if (auto v = id(axp2101_dev).read_byte(0x30))
+            id(axp2101_dev).write_byte(0x30, (uint8_t)(v.value() | 0x01));            // Vbat ADC on
+      - script.execute: apply_brightness
+      - delay: 30s
+      - lambda: |-
+          if (id(print_status_sensor).has_state()) {
+            std::string s = id(print_status_sensor).state;
+            std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+            id(is_printing) = (s == "running" || s == "prepare");
+            id(is_paused) = (s.find("pause") != std::string::npos);
+          }
+          if (id(left_nozzle_temp).has_state() && id(right_nozzle_temp).has_state()) {
+            id(active_nozzle_is_left) = (id(left_nozzle_temp).state > id(right_nozzle_temp).state);
+          }
+      - if:
+          condition:
+            lambda: return id(is_printing) || id(is_paused);
+          then:
+            - lvgl.page.show: page_home
+      - script.execute: update_home_view
+
+# ── CST9217 local patched component (fixes deprecated status_set calls) ─────
+# Folder: local_components/cst9217/ alongside this YAML file
+# Patches: status_set_error/warning(.c_str()) → LOG_STR("static") + ESP_LOGE/W
+external_components:
+  - source:
+      type: local
+      path: local_components
+    components: [cst9217]
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  >>> EDIT THIS BLOCK <<<  — match these to YOUR Home Assistant entity names.
+#  In HA, the Bambu Lab integration creates entities like
+#  sensor.<printer_id>_nozzle_temperature and sensor.<ams_id>_tray_1.
+#  Open Developer Tools → States in HA and copy the prefixes here.
+# ══════════════════════════════════════════════════════════════════════════════
+substitutions:
+  # Printer entity prefix, e.g. "x1c", "p1s", "a1", "h2d" → sensor.<printer_id>_*
+  printer_id: "x1c"
+  # Friendly name shown on the dashboard header.
+  printer_name: "Bambu Lab"
+  # AMS entity prefix → sensor.<ams_id>_tray_1 … _tray_4, _humidity, _temperature.
+  # If you have no AMS, leave as-is; the tiles simply show "--".
+  ams_id: "ams_2_pro"
+  # AMS HT (single high-temp spool) entity prefix → sensor.<ams_ht_id>_tray_1, etc.
+  ams_ht_id: "ams_ht"
+  # Clock + end-time timezone (IANA name, https://en.wikipedia.org/wiki/List_of_tz_database_time_zones).
+  timezone: "America/New_York"
+  # ESPHome node name (mDNS host). Lowercase letters, digits and hyphens only.
+  device_name: "bambu-dashboard"
+
+esp32:
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+  baud_rate: 115200
+
+api:
+  reboot_timeout: 0s
+  max_connections: 2        # Only HA needs to connect; 2026.5.0 default dropped to 5
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: true
+  power_save_mode: none
+  reboot_timeout: 10min
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+# ── Time ──────────────────────────────────────────────────────────────────────
+time:
+  - platform: homeassistant
+    id: ha_time
+    timezone: ${timezone}
+    on_time_sync:
+      then:
+        - script.execute: update_idle_clock
+    on_time:
+      - seconds: 0
+        then:
+          - script.execute: update_idle_clock
+
+# ── Bus configuration — exact from Waveshare reference ───────────────────────
+i2c:
+  - id: bus_a
+    sda: GPIO15
+    scl: GPIO14
+    scan: true
+
+# ── I2C devices for direct register access ───────────────────────────────────
+i2c_device:
+  - id: axp2101_dev
+    i2c_id: bus_a
+    address: 0x34
+
+spi:
+  - id: display_qspi
+    type: quad
+    clk_pin: GPIO38
+    data_pins:
+      - GPIO4
+      - GPIO5
+      - GPIO6
+      - GPIO7
+
+# ── Display ────────────────────────────────────────────────────────────────
+display:
+  - platform: mipi_spi
+    id: disp1
+    model: WAVESHARE-ESP32-S3-TOUCH-AMOLED-1.75
+    bus_mode: quad
+    reset_pin: GPIO39
+    cs_pin: GPIO12
+    dimensions:
+      height: 466
+      width: 466
+      offset_width: 6
+      offset_height: 0
+    auto_clear_enabled: false
+    update_interval: never
+    init_sequence:
+      # CASET: column address set — offset 6px to fix right edge green line
+      - [0x2A, 0x00, 0x06, 0x01, 0xD1]
+
+# ── Brightness via CO5300 brightness register ─────────────────────────────
+output:
+  - platform: template
+    id: backlight_brightness
+    type: float
+    write_action:
+      then:
+        - lambda: |-
+            id(disp1).set_brightness(state * 255);
+
+light:
+  - platform: monochromatic
+    id: display_backlight
+    name: "Backlight"
+    output: backlight_brightness
+    default_transition_length:
+      milliseconds: 0
+    initial_state:
+      brightness: 80%
+    restore_mode: ALWAYS_ON
+
+# ── Touchscreen ────────────────────────────────────────────────────────────
+touchscreen:
+  - platform: cst9217
+    display: disp1
+    id: ts_disp1
+    reset_pin: GPIO40
+    update_interval: 50ms  # Polling mode — interrupt_pin freed for deep sleep wake
+    transform:
+      mirror_x: true
+      mirror_y: true
+    # ── Swipe navigation ──────────────────────────────────────────────────────
+    # Left/right = paginate the main carousel (page.next/previous skip the
+    # settings + screensaver pages). Down = screensaver, Up = settings, from any
+    # page. `was_swipe` is set during the drag (before release) so widget taps
+    # can tell a swipe apart from a click and ignore it.
+    on_touch:
+      - lambda: |-
+          id(t_x0) = touch.x; id(t_y0) = touch.y;
+          id(t_x1) = touch.x; id(t_y1) = touch.y;
+          id(was_swipe) = false;
+    on_update:
+      - lambda: |-
+          if (!touches.empty()) { id(t_x1) = touches[0].x; id(t_y1) = touches[0].y; }
+          if (abs(id(t_x1) - id(t_x0)) > 45 || abs(id(t_y1) - id(t_y0)) > 45)
+            id(was_swipe) = true;
+    on_release:
+      - lambda: |-
+          int dx = id(t_x1) - id(t_x0), dy = id(t_y1) - id(t_y0);
+          int adx = abs(dx), ady = abs(dy);
+          int cp = id(cur_page);
+          if (adx < 45 && ady < 45) {
+            id(swipe_dir) = 0;                              // tap — let LVGL handle it
+          } else if (adx >= ady) {
+            id(swipe_dir) = (dx < 0) ? 1 : 2;              // horizontal: next / prev (skips drawers)
+          } else {
+            bool down = dy > 0;
+            if (cp == 5)      id(swipe_dir) = down ? 7 : 0; // settings: down exits, up ignored
+            else if (cp == 6) id(swipe_dir) = down ? 8 : 7; // screensaver: down=sleep, up=exit
+            else              id(swipe_dir) = down ? 3 : 4; // dashboard: down=saver, up=settings
+          }
+      - if:
+          condition:
+            lambda: 'return id(swipe_dir) == 1;'
+          then:
+            - lvgl.page.next:
+      - if:
+          condition:
+            lambda: 'return id(swipe_dir) == 2;'
+          then:
+            - lvgl.page.previous:
+      - if:
+          condition:
+            lambda: 'return id(swipe_dir) == 3;'
+          then:
+            - lvgl.page.show: page_screensaver
+      - if:
+          condition:
+            lambda: 'return id(swipe_dir) == 4;'
+          then:
+            - lvgl.page.show: page_control
+      # Drawer exit (code 7) — return to whichever carousel page we came from.
+      - if:
+          condition:
+            lambda: 'return id(swipe_dir) == 7 && id(prev_main) == 0;'
+          then:
+            - lvgl.page.show: page_home
+      - if:
+          condition:
+            lambda: 'return id(swipe_dir) == 7 && id(prev_main) == 1;'
+          then:
+            - lvgl.page.show: page_ams
+      # Swipe down on the screensaver → deep sleep.
+      - if:
+          condition:
+            lambda: 'return id(swipe_dir) == 8;'
+          then:
+            - script.execute: enter_sleep
+
+# ── Deep sleep ───────────────────────────────────────────────────────────────
+# Manual only — entered by swiping down on the screensaver page (no idle timeout).
+# Wake source: GPIO11 (CST9217 INT pin, active-low) — touch to wake
+deep_sleep:
+  id: deep_sleep_ctrl
+  wakeup_pin:
+    number: GPIO11
+    inverted: true
+  wakeup_pin_mode: INVERT_WAKEUP
+
+# ── Globals ────────────────────────────────────────────────────────────────
+globals:
+  - id: is_printing
+    type: bool
+    initial_value: "false"
+
+  - id: is_paused
+    type: bool
+    initial_value: "false"
+
+  - id: active_nozzle_is_left
+    type: bool
+    initial_value: "true"
+
+  - id: brightness_pct
+    type: int
+    restore_value: true
+    initial_value: "80"
+
+  - id: arc_flash_state
+    type: bool
+    initial_value: "true"
+
+  - id: is_charging_global
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+  # Progress readout flip: false = remaining time + %, true = end time + clock.
+  - id: show_end_time
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  # Pre-formatted local end-of-print time, e.g. "12:09 PM" (from sensor.<printer_id>_end_time).
+  - id: end_time_str
+    type: std::string
+    restore_value: no
+
+  # Live battery voltage in millivolts (AXP2101 Vbat ADC), shown while charging.
+  - id: batt_mv
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  # ── Swipe-gesture tracking (touchscreen-driven page navigation) ────────────
+  - id: t_x0           # touch-down x/y
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: t_y0
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: t_x1           # latest x/y during the drag
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: t_y1
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: was_swipe      # set true once movement exceeds the tap threshold
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: swipe_dir      # 0=none 1=next 2=prev 3=saver 4=settings 7=exit-drawer 8=sleep
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: cur_page       # 0=home 1=ams 5=settings 6=screensaver
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: prev_main      # last carousel page (0-3) — where a drawer exit returns to
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+
+# ── Scripts ────────────────────────────────────────────────────────────────
+script:
+  - id: apply_brightness
+    then:
+      - light.turn_on:
+          id: display_backlight
+          brightness: !lambda return id(brightness_pct) / 100.0f;
+      - lvgl.label.update:
+          id: brightness_label
+          text: !lambda |-
+            static char buf[8];
+            snprintf(buf, sizeof(buf), "%d%%", id(brightness_pct));
+            return buf;
+
+  # ── Active nozzle coloring ────────────────────────────────────────────────
+  # Compares left & right nozzle temps to the printer's active nozzle temp.
+  # Whichever side matches (within 3°) is active → white; the other → gray.
+  # Applies to both printing and idle complication labels.
+  - id: update_nozzle_active
+    then:
+      - lambda: |-
+          if (!id(left_nozzle_temp).has_state() ||
+              !id(right_nozzle_temp).has_state() ||
+              !id(active_nozzle_temp).has_state()) return;
+
+          float l = id(left_nozzle_temp).state;
+          float r = id(right_nozzle_temp).state;
+          float a = id(active_nozzle_temp).state;
+
+          float dl = fabsf(l - a);
+          float dr = fabsf(r - a);
+
+          // Closer match = active = white; other = gray
+          uint32_t white = 0xFFFFFF;
+          uint32_t gray  = 0x595959;  // col_tertiary
+          bool left_active = (dl <= dr);
+
+          lv_color_t c_active = lv_color_hex(white);
+          lv_color_t c_idle   = lv_color_hex(gray);
+
+          // Printing labels
+          lv_obj_set_style_text_color(id(left_nozzle_label),
+            left_active ? c_active : c_idle, LV_PART_MAIN);
+          lv_obj_set_style_text_color(id(right_nozzle_label),
+            left_active ? c_idle : c_active, LV_PART_MAIN);
+          // Idle labels (slightly dimmer active, but keep contrast)
+          lv_obj_set_style_text_color(id(idle_left_nozzle_label),
+            left_active ? c_active : c_idle, LV_PART_MAIN);
+          lv_obj_set_style_text_color(id(idle_right_nozzle_label),
+            left_active ? c_idle : c_active, LV_PART_MAIN);
+
+  # ── Idle clock face: "9:41" hero + "FRIDAY · NOV 15" tracked ─────────────
+  - id: update_idle_clock
+    then:
+      - lvgl.label.update:
+          id: idle_clock_label
+          text: !lambda |-
+            static char buf[8];
+            auto t = id(ha_time).now();
+            if (!t.is_valid()) return "--:--";
+            int h = t.hour;
+            if (h == 0) h = 12;
+            if (h > 12) h -= 12;
+            snprintf(buf, sizeof(buf), "%d:%02d", h, t.minute);
+            return buf;
+      - lvgl.label.update:
+          id: idle_date_label
+          text: !lambda |-
+            static char buf[24];
+            auto t = id(ha_time).now();
+            if (!t.is_valid()) return "";
+            const char* days[] = {"SUN","MON","TUE","WED","THU","FRI","SAT"};
+            const char* mons[] = {"JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"};
+            int dow = t.day_of_week - 1;
+            int mon = t.month - 1;
+            if (dow < 0 || dow > 6) dow = 0;
+            if (mon < 0 || mon > 11) mon = 0;
+            snprintf(buf, sizeof(buf), "%s \xc2\xb7 %s %d", days[dow], mons[mon], t.day_of_month);
+            return buf;
+
+  - id: update_arc_color
+    then:
+      - lambda: |-
+          // Don't override paused flash color — interval owns that state
+          if (id(is_paused)) return;
+          float prog = id(print_progress_sensor).has_state() ? id(print_progress_sensor).state : 0;
+          float bed  = id(bed_temp).has_state() ? id(bed_temp).state : 100;
+          uint32_t color;
+          if (prog >= 100) {
+            color = (bed < 46) ? 0x0A84FF : 0x30D158;  // sys-blue=cooled, sys-green=hot
+          } else if (id(is_printing)) {
+            color = 0x30D158;  // sys-green
+          } else {
+            color = 0x30D158;  // dim track shows through anyway when value=0
+          }
+          // Apply to all arc instances
+          lv_color_t c = lv_color_hex(color);
+          lv_obj_set_style_arc_color(id(progress_arc), c, LV_PART_INDICATOR);
+          lv_obj_set_style_arc_color(id(progress_arc_ams), c, LV_PART_INDICATOR);
+          lv_obj_set_style_arc_color(id(progress_arc_ctrl), c, LV_PART_INDICATOR);
+
+  # ── Home view adaptive toggle ─────────────────────────────────────────────
+  # When printing or paused → show printing layout, hide idle layout
+  # When idle → show idle watch-face layout
+  - id: update_home_view
+    then:
+      - lambda: |-
+          bool active = id(is_printing) || id(is_paused);
+          if (active) {
+            lv_obj_add_flag(id(home_idle_group), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(home_printing_group), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(id(time_toggle_zone), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            lv_obj_clear_flag(id(home_idle_group), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(home_printing_group), LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(id(time_toggle_zone), LV_OBJ_FLAG_HIDDEN);
+            id(show_end_time) = false;   // always start a print on remaining-time view
+          }
+
+  # Render the progress hero + sub-line, honoring the tap-to-flip toggle:
+  #   show_end_time=false → hero = time remaining,  sub = percent
+  #   show_end_time=true  → hero = end-of-print clock, sub = current time
+  - id: render_time_readout
+    then:
+      - lambda: |-
+          char hero[20];
+          char sub[16];
+          if (id(show_end_time)) {
+            // HERO = end-of-print time (pre-formatted from the end_time sensor)
+            snprintf(hero, sizeof(hero), "%s", id(end_time_str).empty() ? "--" : id(end_time_str).c_str());
+            // SUB = current local clock
+            auto now = id(ha_time).now();
+            if (now.is_valid()) {
+              int h12 = now.hour % 12; if (h12 == 0) h12 = 12;
+              snprintf(sub, sizeof(sub), "%d:%02d %s", h12, now.minute, now.hour < 12 ? "AM" : "PM");
+            } else {
+              snprintf(sub, sizeof(sub), "--");
+            }
+            // Percent moves below the hero in this view
+            char pctbuf[8];
+            if (id(print_progress_sensor).has_state() && !isnan(id(print_progress_sensor).state))
+              snprintf(pctbuf, sizeof(pctbuf), "%.0f%%", id(print_progress_sensor).state);
+            else
+              snprintf(pctbuf, sizeof(pctbuf), "0%%");
+            lv_label_set_text(id(pct_end_label), pctbuf);
+            lv_obj_clear_flag(id(pct_end_label), LV_OBJ_FLAG_HIDDEN);
+          } else {
+            lv_obj_add_flag(id(pct_end_label), LV_OBJ_FLAG_HIDDEN);
+            // HERO = time remaining (sensor reports hours, float)
+            if (id(remaining_time).has_state() && !isnan(id(remaining_time).state) && id(remaining_time).state > 0) {
+              int tmins = (int)(id(remaining_time).state * 60.0f);
+              int h = tmins / 60, m = tmins % 60;
+              if (h > 0) snprintf(hero, sizeof(hero), "%dh %dm", h, m);
+              else       snprintf(hero, sizeof(hero), "%dm", m);
+            } else {
+              snprintf(hero, sizeof(hero), "--");
+            }
+            // SUB = percent complete
+            if (id(print_progress_sensor).has_state() && !isnan(id(print_progress_sensor).state)) {
+              snprintf(sub, sizeof(sub), "%.0f%%", id(print_progress_sensor).state);
+            } else {
+              snprintf(sub, sizeof(sub), "0%%");
+            }
+          }
+          lv_label_set_text(id(time_remaining_label), hero);
+          lv_label_set_text(id(pct_hero_label), sub);
+
+  # ── Sleep: turn display off, then enter deep sleep ────────────────────────
+  # Triggered by swiping down on the screensaver page. Wake on touch.
+  - id: enter_sleep
+    then:
+      - logger.log: "Sleep button pressed — entering deep sleep"
+      - light.turn_off: display_backlight
+      - delay: 200ms
+      - deep_sleep.enter: deep_sleep_ctrl
+
+  # Apply ALL charging-dependent UI (battery color, bar color, subtitle text,
+  # bolt icon) from is_charging_global. Safe to call before the battery gauge
+  # has a reading — when no % is known we skip the %-dependent low/orange tints
+  # but still reflect charging state. Called from both axp_charging.on_state
+  # and battery_level_pct.on_value so the indicator is correct at boot without
+  # needing a charger re-plug to fire on_state.
+  - id: apply_charge_ui
+    then:
+      - lambda: |-
+          bool chg = id(is_charging_global);
+          bool has = id(battery_level_pct).has_state();
+          float pct = has ? id(battery_level_pct).state : 0.0f;
+          uint32_t color;
+          if (chg)              color = 0x30D158;   // sys-green
+          else if (has && pct < 15) color = 0xFF453A; // sys-red
+          else if (has && pct < 30) color = 0xFF9F0A; // sys-orange
+          else                  color = 0xFFFFFF;   // white
+          lv_obj_set_style_text_color(id(batt_pct_label), lv_color_hex(color), LV_PART_MAIN);
+          lv_obj_set_style_bg_color(id(batt_bar), lv_color_hex(color), LV_PART_INDICATOR);
+          const char* base;
+          if (chg) base = (has && pct >= 100) ? "Charged" : "Charging";
+          else     base = "On battery";
+          char sub[28];
+          if (chg && id(batt_mv) > 0)
+            snprintf(sub, sizeof(sub), "%s (%.2fV)", base, id(batt_mv) / 1000.0f);
+          else
+            snprintf(sub, sizeof(sub), "%s", base);
+          lv_label_set_text(id(batt_subtitle_label), sub);
+          uint32_t sub_color = chg ? 0x30D158 : 0x595959;
+          lv_obj_set_style_text_color(id(batt_subtitle_label), lv_color_hex(sub_color), LV_PART_MAIN);
+          if (chg) lv_obj_clear_flag(id(batt_bolt_icon), LV_OBJ_FLAG_HIDDEN);
+          else     lv_obj_add_flag(id(batt_bolt_icon), LV_OBJ_FLAG_HIDDEN);
+
+# ── Intervals ─────────────────────────────────────────────────────────────────
+interval:
+  # Charging detection — poll AXP2101 PMU_STATUS1 (reg 0x00) bit5 (0x20) = VBUS.
+  # NOTE: this is driven from an interval rather than the axp_charging template
+  # binary_sensor's own lambda, because that lambda was NOT evaluating at boot —
+  # diagnostics showed reg 0x00 = 0x38 (VBUS present) the whole boot yet the
+  # sensor never published, so USB-plugged-at-boot went undetected until a
+  # re-plug. The interval reliably runs from the first second; publish_state()
+  # de-dupes and fires on_state (→ is_charging_global + apply_charge_ui) on change.
+  - interval: 2s
+    then:
+      - lambda: |-
+          auto b = id(axp2101_dev).read_byte(0x00);
+          if (!b) return;
+          bool chg = (b.value() & 0x20) != 0;  // bit5 = VBUS good
+          id(axp_charging).publish_state(chg);   // report to HA
+          id(is_charging_global) = chg;
+          // Battery voltage from the AXP2101 Vbat ADC (reg 0x34[5:0]:0x35 = 14-bit mV)
+          auto vh = id(axp2101_dev).read_byte(0x34);
+          auto vl = id(axp2101_dev).read_byte(0x35);
+          if (vh && vl) id(batt_mv) = (((vh.value() & 0x3F) << 8) | vl.value());
+          // Refresh the charge UI every tick so the live voltage readout updates.
+          // (The template binary_sensor's on_state does not fire reliably in this
+          // build, so the interval owns state + UI directly.)
+          id(apply_charge_ui).execute();
+
+  # Paused arc flash — 500ms, only fires when paused
+  - interval: 500ms
+    then:
+      - if:
+          condition:
+            lambda: return id(is_paused);
+          then:
+            - lambda: |-
+                id(arc_flash_state) = !id(arc_flash_state);
+                uint32_t color = id(arc_flash_state) ? 0xFF9F0A : 0x141414;  // sys-orange / dim
+                lv_color_t c = lv_color_hex(color);
+                lv_obj_set_style_arc_color(id(progress_arc), c, LV_PART_INDICATOR);
+                lv_obj_set_style_arc_color(id(progress_arc_ams), c, LV_PART_INDICATOR);
+                lv_obj_set_style_arc_color(id(progress_arc_ctrl), c, LV_PART_INDICATOR);
+
+  # ── Screensaver driver — ~60fps, only while on page_screensaver ───────────
+  # A field of small WHITE stars twinkle (fade in, hold, fade out, then a new
+  # one lights up elsewhere) so the field is always changing. Every 5-7s one —
+  # occasionally two — shooting stars streak across from a random edge.
+  # White only. Constant motion = no static OLED pixels.
+  #
+  # Smoothness budget: 16ms tick == LVGL render period (LV_DEF_REFR_PERIOD).
+  # Only objects whose pixels CHANGE this frame invalidate; idle (steady) stars
+  # don't touch LVGL at all. Concurrent twinklers (CAP_TW) + shooting lines stay
+  # well under LV_INV_BUF_SIZE (32), so LVGL always does fast partial redraws.
+  - interval: 16ms
+    then:
+      - lambda: |-
+          if (lv_scr_act() != id(page_screensaver).obj) return;
+
+          static const float CXc = 233.0f, CYc = 233.0f, RAD = 233.0f;
+
+          static const int NSTARS = 40;     // pool; most idle/invisible at any time
+          static const int CAP_TW = 14;     // max simultaneously-changing stars
+          static const int NSHOOT = 2;      // shooting-star streaks
+          static const int TRAIL  = 16;     // points in each shooting-star tail
+
+          static bool   init = false;
+          static lv_obj_t* star[NSTARS];
+          static int    sst[NSTARS];        // 0 = idle (dark), 1 = twinkling
+          static float  sprog[NSTARS], sdur[NSTARS], smax[NSTARS], swait[NSTARS];
+          static int    activeTw = 0;
+
+          static lv_obj_t* shoot[NSHOOT];
+          static lv_obj_t* shead[NSHOOT];   // bright meteor head dot
+          static lv_point_precise_t spts[NSHOOT][TRAIL];
+          static int    shon[NSHOOT], shcnt[NSHOOT], shexit[NSHOOT];
+          static float  shx[NSHOOT], shy[NSHOOT], shvx[NSHOOT], shvy[NSHOOT];
+          static float  shcurv[NSHOOT], shprog[NSHOOT], shdur[NSHOOT];
+          static float  shtimer = 90.0f;
+
+          static uint32_t rng = 0;
+          auto rnd  = [&]() -> uint32_t { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng; };
+          auto frnd = [&]() -> float    { return (rnd() & 0xFFFF) / 65535.0f; };
+
+          if (!init) {
+            rng = millis() | 1u;
+            lv_obj_t* parent = id(page_screensaver).obj;
+            // never let dynamically-created children scroll the page
+            lv_obj_set_scrollbar_mode(parent, LV_SCROLLBAR_MODE_OFF);
+            lv_obj_clear_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
+            // white stars at fixed positions, start dark
+            for (int i = 0; i < NSTARS; i++) {
+              lv_obj_t* s = lv_obj_create(parent);
+              lv_obj_remove_style_all(s);
+              lv_obj_set_style_border_width(s, 0, 0);
+              lv_obj_set_style_radius(s, LV_RADIUS_CIRCLE, 0);
+              lv_obj_set_style_bg_color(s, lv_color_white(), 0);
+              lv_obj_set_style_bg_opa(s, LV_OPA_TRANSP, 0);
+              lv_obj_clear_flag(s, LV_OBJ_FLAG_CLICKABLE);
+              lv_obj_clear_flag(s, LV_OBJ_FLAG_SCROLLABLE);
+              lv_obj_add_flag(s, LV_OBJ_FLAG_IGNORE_LAYOUT);
+              float a  = frnd() * 6.28318f;
+              float rr = sqrtf(frnd()) * (RAD - 10.0f);  // uniform within disc
+              int   d  = 3 + (int)(frnd() * 4.0f);       // 3..6 px
+              lv_obj_set_size(s, d, d);
+              lv_obj_set_pos(s, (int)(CXc + cosf(a) * rr) - d / 2,
+                                (int)(CYc + sinf(a) * rr) - d / 2);
+              star[i]  = s;
+              sst[i]   = 0;
+              swait[i] = frnd() * 200.0f;                // staggered first light-up
+            }
+            // shooting-star streaks: white rounded poly-line with a DASHED stroke
+            // (broken-up trail) + a brighter solid head dot. Start hidden.
+            for (int i = 0; i < NSHOOT; i++) {
+              lv_obj_t* L = lv_line_create(parent);
+              lv_obj_remove_style_all(L);
+              lv_obj_set_style_line_width(L, 4, 0);
+              lv_obj_set_style_line_color(L, lv_color_white(), 0);
+              lv_obj_set_style_line_rounded(L, true, 0);
+              lv_obj_set_style_line_dash_width(L, 8, 0);   // broken trail: 8px dashes
+              lv_obj_set_style_line_dash_gap(L, 7, 0);     // with 7px gaps
+              lv_obj_set_style_line_opa(L, LV_OPA_TRANSP, 0);
+              lv_obj_clear_flag(L, LV_OBJ_FLAG_CLICKABLE);
+              lv_obj_clear_flag(L, LV_OBJ_FLAG_SCROLLABLE);
+              lv_obj_add_flag(L, LV_OBJ_FLAG_IGNORE_LAYOUT);
+              for (int k = 0; k < TRAIL; k++) { spts[i][k].x = 0; spts[i][k].y = 0; }
+              lv_line_set_points(L, spts[i], 2);
+              shoot[i] = L;
+              shon[i]  = 0;
+              // bright solid head dot
+              lv_obj_t* H = lv_obj_create(parent);
+              lv_obj_remove_style_all(H);
+              lv_obj_set_style_border_width(H, 0, 0);
+              lv_obj_set_style_radius(H, LV_RADIUS_CIRCLE, 0);
+              lv_obj_set_style_bg_color(H, lv_color_white(), 0);
+              lv_obj_set_style_bg_opa(H, LV_OPA_TRANSP, 0);
+              lv_obj_set_size(H, 7, 7);
+              lv_obj_clear_flag(H, LV_OBJ_FLAG_CLICKABLE);
+              lv_obj_clear_flag(H, LV_OBJ_FLAG_SCROLLABLE);
+              lv_obj_add_flag(H, LV_OBJ_FLAG_IGNORE_LAYOUT);
+              shead[i] = H;
+            }
+            init = true;
+          }
+
+          // launch shooting star i from a random edge, arcing across the disc
+          auto launch = [&](int i) {
+            float ea = frnd() * 6.28318f;
+            shx[i] = CXc + cosf(ea) * RAD;
+            shy[i] = CYc + sinf(ea) * RAD;
+            float tx = CXc + (frnd() - 0.5f) * RAD;    // aim near centre
+            float ty = CYc + (frnd() - 0.5f) * RAD;
+            float hd  = atan2f(ty - shy[i], tx - shx[i]);
+            float spd = 3.2f + frnd() * 2.0f;          // 3.2..5.2 px/frame (slow, calm)
+            shvx[i] = cosf(hd) * spd;
+            shvy[i] = sinf(hd) * spd;
+            shcurv[i] = (frnd() - 0.5f) * 0.05f;       // gentle initial curvature
+            shdur[i]  = (3.0f * RAD) / spd + 40.0f;    // generous lifetime cap
+            shprog[i] = 0.0f;
+            shexit[i] = -1;
+            shcnt[i]  = 1;
+            for (int k = 0; k < TRAIL; k++) { spts[i][k].x = shx[i]; spts[i][k].y = shy[i]; }
+            shon[i]   = 1;
+          };
+
+          // ── spawn shooting stars on a 5-7s cadence ──
+          shtimer -= 1.0f;
+          if (shtimer <= 0.0f) {
+            int launched = 0;
+            for (int i = 0; i < NSHOOT && launched < 1; i++) {
+              if (!shon[i]) { launch(i); launched++; }
+            }
+            if (frnd() < 0.35f) {                      // ~35%: send a second one too
+              for (int i = 0; i < NSHOOT; i++) {
+                if (!shon[i]) { launch(i); break; }
+              }
+            }
+            shtimer = 150.0f + frnd() * 130.0f;        // ~2.4-4.5s (more frequent)
+          }
+
+          // ── update shooting stars (curved path + trailing tail) ──
+          for (int i = 0; i < NSHOOT; i++) {
+            if (!shon[i]) continue;
+            // wander the heading a little so the arc isn't a perfect circle
+            shcurv[i] += (frnd() - 0.5f) * 0.006f;
+            if (shcurv[i] >  0.06f) shcurv[i] =  0.06f;
+            if (shcurv[i] < -0.06f) shcurv[i] = -0.06f;
+            float cs = cosf(shcurv[i]), sn = sinf(shcurv[i]);
+            float nvx = shvx[i] * cs - shvy[i] * sn;
+            float nvy = shvx[i] * sn + shvy[i] * cs;
+            shvx[i] = nvx; shvy[i] = nvy;
+            shx[i] += shvx[i];
+            shy[i] += shvy[i];
+            shprog[i] += 1.0f;
+            // push new head onto the front of the trail
+            for (int k = (shcnt[i] < TRAIL ? shcnt[i] : TRAIL - 1); k > 0; k--) spts[i][k] = spts[i][k - 1];
+            spts[i][0].x = shx[i];
+            spts[i][0].y = shy[i];
+            if (shcnt[i] < TRAIL) shcnt[i]++;
+            int npts = shcnt[i] < 2 ? 2 : shcnt[i];
+            lv_line_set_points(shoot[i], spts[i], npts);
+            // fade in over first 8 frames; once head leaves the disc, fade out
+            float a = shprog[i] < 8.0f ? shprog[i] / 8.0f : 1.0f;
+            float dx = shx[i] - CXc, dy = shy[i] - CYc;
+            if (dx * dx + dy * dy > RAD * RAD) {
+              if (shexit[i] < 0) shexit[i] = 0; else shexit[i]++;
+              a *= 1.0f - (float)shexit[i] / 18.0f;
+            }
+            if (a < 0.0f) a = 0.0f;
+            if (a > 1.0f) a = 1.0f;
+            lv_obj_set_style_line_opa(shoot[i], (lv_opa_t)(a * 200.0f), 0);  // trail dimmer than head
+            lv_obj_set_pos(shead[i], (int)shx[i] - 3, (int)shy[i] - 3);
+            lv_obj_set_style_bg_opa(shead[i], (lv_opa_t)(a * 255.0f), 0);
+            if ((shexit[i] >= 18) || (shprog[i] >= shdur[i])) {
+              shon[i] = 0;
+              lv_obj_set_style_line_opa(shoot[i], LV_OPA_TRANSP, 0);
+              lv_obj_set_style_bg_opa(shead[i], LV_OPA_TRANSP, 0);
+            }
+          }
+
+          // ── update twinkling stars (slow fade in/out) ──
+          for (int i = 0; i < NSTARS; i++) {
+            if (sst[i] == 0) {                          // idle: count down, maybe ignite
+              swait[i] -= 1.0f;
+              if (swait[i] <= 0.0f && activeTw < CAP_TW) {
+                sst[i]   = 1;
+                sprog[i] = 0.0f;
+                sdur[i]  = 150.0f + frnd() * 170.0f;    // ~2.4-5.1s twinkle (calm, lingers)
+                smax[i]  = 0.55f + frnd() * 0.45f;      // peak brightness
+                activeTw++;
+              }
+              continue;
+            }
+            sprog[i] += 1.0f;                           // sine 0..1..0 over sdur
+            float a = sinf(3.14159f * sprog[i] / sdur[i]) * smax[i];
+            if (a < 0.0f) a = 0.0f;
+            lv_obj_set_style_bg_opa(star[i], (lv_opa_t)(a * 255.0f), 0);
+            if (sprog[i] >= sdur[i]) {
+              sst[i] = 0;
+              activeTw--;
+              swait[i] = 40.0f + frnd() * 260.0f;       // idle before next twinkle
+              lv_obj_set_style_bg_opa(star[i], LV_OPA_TRANSP, 0);
+            }
+          }
+
+# ── Fonts ──────────────────────────────────────────────────────────────────
+# Studio v2 typography — Apple-esque hierarchy
+# Sized for 5-foot readability — Apple Watch viewable from arm's length
+# but this is a printer dashboard viewable from across the room
+font:
+  # Hero "26%" — 100pt bold (smaller than v2.1 to leave more room for bottom rows)
+  - file: "gfonts://Outfit@700"
+    id: font_pct_hero
+    size: 100
+    glyphs: " 0123456789%"
+
+  # Hero "9:41" — 104pt light (Apple Watch idle face)
+  - file: "gfonts://Outfit@300"
+    id: font_time_hero
+    size: 104
+    glyphs: " 0123456789:"
+
+  # Battery % large
+  - file: "gfonts://Outfit@700"
+    id: font_battery
+    size: 64
+    glyphs: " 0123456789%"
+
+  # "2h 14m" time remaining — now the hero focus (was a small label before)
+  - file: "gfonts://Outfit@600"
+    id: font_remaining
+    size: 38
+    glyphs: " 0123456789hm.:%"
+
+  # Time remaining HERO — large focal point (smaller than old 100pt % hero)
+  - file: "gfonts://Outfit@600"
+    id: font_time_focus
+    size: 72
+    glyphs: " 0123456789hm:-APM"   # h/m for remaining; :,-,A,P,M for end-time clock
+
+  # Brightness % — includes + and - glyphs for the buttons!
+  - file: "gfonts://Outfit@700"
+    id: font_brightness
+    size: 32
+    glyphs: " 0123456789%+-"
+
+  # Temp values (219°, 55°) — extra big now that hero shrank to make room
+  - file: "gfonts://Outfit@600"
+    id: font_temp
+    size: 32
+    glyphs: " 0123456789.°-"
+
+  # Stage label, printer name, AMS unit names, small % — bigger for visibility
+  - file: "gfonts://Outfit@600"
+    id: font_med
+    size: 26
+    glyphs: " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.:%/-°"
+
+  # Layer count — bigger for readability
+  - file: "gfonts://Outfit@500"
+    id: font_layer
+    size: 26
+    glyphs: " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.:%/-°"
+
+  # Active tray "PLA"
+  - file: "gfonts://Outfit@700"
+    id: font_active
+    size: 20
+    glyphs: " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
+
+  # Status pill "Ready", AMS section titles — bigger for AMS readability
+  - file: "gfonts://Outfit@600"
+    id: font_pill
+    size: 18
+    glyphs: " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789·-()."
+
+  # Tracked uppercase labels: "TIME REMAINING", "FRIDAY · NOV 15", "BATTERY"
+  - file: "gfonts://Outfit@600"
+    id: font_label_t
+    size: 16
+    glyphs: " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789·-"
+
+  # Complication labels: "LEFT", "RIGHT", "BED" — bumped for legibility
+  - file: "gfonts://Outfit@700"
+    id: font_comp
+    size: 16
+    glyphs: " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
+
+  # MDI icons — bumped sizes for readability
+  - file: https://github.com/Templarian/MaterialDesign-Webfont/raw/master/fonts/materialdesignicons-webfont.ttf
+    id: icons_lg
+    size: 30
+    glyphs:
+      - "\U000F0079"  # battery
+      - "\U000F0084"  # battery-charging
+      - "\U000F0DBE"  # power
+      - "\U000F0CE4"  # weather-sunny / sun
+      - "\U000F0CE7"  # weather-night
+      - "\U000F04B2"  # sleep (Zzz)
+
+  # Charging bolt sized to match font_battery (the big % number) so it sits
+  # inline with the value on the battery page.
+  - file: https://github.com/Templarian/MaterialDesign-Webfont/raw/master/fonts/materialdesignicons-webfont.ttf
+    id: icons_batt
+    size: 64
+    glyphs:
+      - "\U000F0084"  # battery-charging
+
+  - file: https://github.com/Templarian/MaterialDesign-Webfont/raw/master/fonts/materialdesignicons-webfont.ttf
+    id: icons_md
+    size: 26
+    glyphs:
+      - "\U000F0E5B"  # nozzle
+      - "\U000F185B"  # bed
+      - "\U000F1487"  # chamber
+      - "\U000F058E"  # humidity
+
+  - file: https://github.com/Templarian/MaterialDesign-Webfont/raw/master/fonts/materialdesignicons-webfont.ttf
+    id: icons_sm
+    size: 18
+    glyphs:
+      - "\U000F0E5B"  # nozzle
+      - "\U000F185B"  # bed
+      - "\U000F012C"  # check
+      - "\U000F03E4"  # pause
+
+# ── Colors ─────────────────────────────────────────────────────────────────
+# Apple iOS dark mode system colors
+color:
+  - id: sys_green    # printing, ready, charging
+    hex: "30D158"
+  - id: sys_blue     # cooled, complete
+    hex: "0A84FF"
+  - id: sys_orange   # paused
+    hex: "FF9F0A"
+  - id: sys_red      # error, low battery
+    hex: "FF453A"
+  - id: sys_teal     # humidity, info
+    hex: "64D2FF"
+  - id: sys_purple   # other stages
+    hex: "BF5AF2"
+  - id: sys_yellow   # AMS HT accent
+    hex: "FFE580"
+  # Neutral scale
+  - id: col_white    # primary text
+    hex: "FFFFFF"
+  - id: col_secondary # 65% white
+    hex: "A6A6A6"
+  - id: col_tertiary  # 35% white
+    hex: "595959"
+  - id: col_quaternary # 18% white
+    hex: "2E2E2E"
+  - id: col_separator  # 8% white
+    hex: "141414"
+  - id: col_fill_sec   # 12% white
+    hex: "1F1F1F"
+  - id: col_fill_ter   # 6% white
+    hex: "0F0F0F"
+  - id: col_arc_track  # arc unfilled state
+    hex: "0F0F0F"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SENSORS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Reads battery % from register 0x2D and charging status from register 0x00
+# AXP2101 I2C address: 0x34
+# axp2101 ESPHome component not yet released — using direct I2C reads instead
+
+sensor:
+  # Battery level — AXP2101 reg 0xA4 = SOC (state of charge) 0–100%
+  # FIX from v1: register 0x2D was wrong (that's a config register, not SOC)
+  # The correct AXP2101 fuel gauge register is 0xA4 (BAT_PERCENT_DATA)
+  - platform: template
+    id: battery_level_pct
+    name: "Battery Level"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      if (auto b = id(axp2101_dev).read_byte(0xA4)) {
+        uint8_t v = b.value();
+        // AXP2101 returns 0xFF / >100 when gauge not initialized — filter those
+        if (v <= 100) {
+          return (float)v;
+        }
+      }
+      return NAN;
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: batt_pct_label
+            text: !lambda |-
+              static char buf[8];
+              snprintf(buf, sizeof(buf), "%d%%", (int)x);
+              return buf;
+        - lvgl.bar.update:
+            id: batt_bar
+            value: !lambda return (int)x;
+        - script.execute: apply_charge_ui
+
+  # ── Print sensors ──────────────────────────────────────────────────────────
+  - platform: homeassistant
+    id: print_progress_sensor
+    entity_id: sensor.${printer_id}_print_progress
+    filters:
+      - throttle: 3s
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: return !isnan(x);
+            then:
+              - lvgl.arc.update:
+                  id: progress_arc
+                  value: !lambda return (int)x;
+              - lvgl.arc.update:
+                  id: progress_arc_ams
+                  value: !lambda return (int)x;
+              - lvgl.arc.update:
+                  id: progress_arc_ctrl
+                  value: !lambda return (int)x;
+              - script.execute: render_time_readout
+              - script.execute: update_arc_color
+
+  - platform: homeassistant
+    id: remaining_time
+    entity_id: sensor.${printer_id}_remaining_time
+    filters:
+      # heartbeat (not throttle): re-emits the latest value every interval so the
+      # label always converges to HA's current reading. `throttle` passed only the
+      # first sample per window and dropped the rest, which could latch the label
+      # at a stale transient (e.g. nozzle stuck at 251° while HA read 50°) when the
+      # value then settled quietly with no further change events.
+      - heartbeat: 3s
+    on_value:
+      then:
+        - script.execute: render_time_readout
+
+  - platform: homeassistant
+    id: current_layer
+    entity_id: sensor.${printer_id}_current_layer
+    filters:
+      - throttle: 3s
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: return !isnan(x);
+            then:
+              - lvgl.label.update:
+                  id: layer_label
+                  text: !lambda |-
+                    static char buf[24];
+                    int tot = id(total_layers).has_state() ? (int)id(total_layers).state : 0;
+                    snprintf(buf, sizeof(buf), "%d / %d", (int)x, tot);
+                    return buf;
+
+  - platform: homeassistant
+    id: total_layers
+    entity_id: sensor.${printer_id}_total_layer_count
+    filters:
+      - throttle: 30s
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: return !isnan(x);
+            then:
+              - lvgl.label.update:
+                  id: layer_label
+                  text: !lambda |-
+                    static char buf[24];
+                    int cur = id(current_layer).has_state() ? (int)id(current_layer).state : 0;
+                    snprintf(buf, sizeof(buf), "%d / %d", cur, (int)x);
+                    return buf;
+
+  - platform: homeassistant
+    id: left_nozzle_temp
+    entity_id: sensor.${printer_id}_left_nozzle_temperature
+    filters:
+      # heartbeat (not throttle): re-emits the latest value every interval so the
+      # label always converges to HA's current reading. `throttle` passed only the
+      # first sample per window and dropped the rest, which could latch the label
+      # at a stale transient (e.g. nozzle stuck at 251° while HA read 50°) when the
+      # value then settled quietly with no further change events.
+      - heartbeat: 3s
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: return !isnan(x);
+            then:
+              - lvgl.label.update:
+                  id: left_nozzle_label
+                  text: !lambda |-
+                    static char buf[8]; snprintf(buf, sizeof(buf), "%.0f°", x); return buf;
+              - lvgl.label.update:
+                  id: idle_left_nozzle_label
+                  text: !lambda |-
+                    static char buf[8]; snprintf(buf, sizeof(buf), "%.0f°", x); return buf;
+              - script.execute: update_nozzle_active
+
+  - platform: homeassistant
+    id: right_nozzle_temp
+    entity_id: sensor.${printer_id}_right_nozzle_temperature
+    filters:
+      # heartbeat (not throttle): re-emits the latest value every interval so the
+      # label always converges to HA's current reading. `throttle` passed only the
+      # first sample per window and dropped the rest, which could latch the label
+      # at a stale transient (e.g. nozzle stuck at 251° while HA read 50°) when the
+      # value then settled quietly with no further change events.
+      - heartbeat: 3s
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: return !isnan(x);
+            then:
+              - lvgl.label.update:
+                  id: right_nozzle_label
+                  text: !lambda |-
+                    static char buf[8];
+                    if (x < 1.0f) { snprintf(buf, sizeof(buf), "--"); }
+                    else { snprintf(buf, sizeof(buf), "%.0f°", x); }
+                    return buf;
+              - lvgl.label.update:
+                  id: idle_right_nozzle_label
+                  text: !lambda |-
+                    static char buf[8];
+                    if (x < 1.0f) { snprintf(buf, sizeof(buf), "--"); }
+                    else { snprintf(buf, sizeof(buf), "%.0f°", x); }
+                    return buf;
+              - script.execute: update_nozzle_active
+
+  # Reference active-nozzle temp — printer reports the in-use nozzle here.
+  # Whichever of left/right matches this is the active nozzle (→ white).
+  - platform: homeassistant
+    id: active_nozzle_temp
+    entity_id: sensor.${printer_id}_nozzle_temperature
+    filters:
+      # heartbeat (not throttle): re-emits the latest value every interval so the
+      # label always converges to HA's current reading. `throttle` passed only the
+      # first sample per window and dropped the rest, which could latch the label
+      # at a stale transient (e.g. nozzle stuck at 251° while HA read 50°) when the
+      # value then settled quietly with no further change events.
+      - heartbeat: 3s
+    on_value:
+      then:
+        - script.execute: update_nozzle_active
+
+  - platform: homeassistant
+    id: bed_temp
+    entity_id: sensor.${printer_id}_bed_temperature
+    filters:
+      # heartbeat (not throttle): re-emits the latest value every interval so the
+      # label always converges to HA's current reading. `throttle` passed only the
+      # first sample per window and dropped the rest, which could latch the label
+      # at a stale transient (e.g. nozzle stuck at 251° while HA read 50°) when the
+      # value then settled quietly with no further change events.
+      - heartbeat: 3s
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: return !isnan(x);
+            then:
+              - lvgl.label.update:
+                  id: bed_temp_label
+                  text: !lambda |-
+                    static char buf[8]; snprintf(buf, sizeof(buf), "%.0f°", x); return buf;
+              - lvgl.label.update:
+                  id: idle_bed_temp_label
+                  text: !lambda |-
+                    static char buf[8]; snprintf(buf, sizeof(buf), "%.0f°", x); return buf;
+              - script.execute: update_arc_color
+
+  - platform: homeassistant
+    id: chamber_temp
+    entity_id: sensor.${printer_id}_chamber_temperature
+    filters:
+      - throttle: 15s
+    # Not displayed in v2 design — sensor kept for future use / HA visibility
+
+  # ── AMS sensors ────────────────────────────────────────────────────────────
+  - platform: homeassistant
+    id: ams2_hum
+    entity_id: sensor.${ams_id}_humidity
+    filters:
+      - throttle: 30s
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: return !isnan(x);
+            then:
+              - lvgl.label.update:
+                  id: ams_hum_label
+                  text: !lambda |-
+                    static char buf[8]; snprintf(buf, sizeof(buf), "%.0f%%", x); return buf;
+
+  - platform: homeassistant
+    id: ams2_temp
+    entity_id: sensor.${ams_id}_temperature
+    filters:
+      - throttle: 30s
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: return !isnan(x);
+            then:
+              - lvgl.label.update:
+                  id: ams_temp_label
+                  text: !lambda |-
+                    static char buf[8]; snprintf(buf, sizeof(buf), "%.0f°", x); return buf;
+
+  - platform: homeassistant
+    id: ams_ht_hum
+    entity_id: sensor.${ams_ht_id}_humidity
+    filters:
+      - throttle: 30s
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: return !isnan(x);
+            then:
+              - lvgl.label.update:
+                  id: ams_ht_hum_label
+                  text: !lambda |-
+                    static char buf[8]; snprintf(buf, sizeof(buf), "%.0f%%", x); return buf;
+
+  - platform: homeassistant
+    id: ams_ht_temp_s
+    entity_id: sensor.${ams_ht_id}_temperature
+    filters:
+      - throttle: 30s
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: return !isnan(x);
+            then:
+              - lvgl.label.update:
+                  id: ams_ht_temp_label
+                  text: !lambda |-
+                    static char buf[8]; snprintf(buf, sizeof(buf), "%.0f°", x); return buf;
+
+# ── Binary sensors ────────────────────────────────────────────────────────────
+binary_sensor:
+  # AXP2101 charging detection — reg 0x01 (PMU_STATUS2) bits 7:5 = charge status
+  # 000 = tri-state (not charging)
+  # 001 = pre-charge        ← charging
+  # 010 = constant current  ← charging
+  # 011 = constant voltage  ← charging
+  # ── Charging detection ─────────────────────────────────────────────────────
+  # AXP2101 PMU_STATUS1 (reg 0x00) bit 5 (0x20) = VBUS present (USB connected).
+  # This is the most reliable single bit for "plugged in / charging" — the
+  # charge-state bits in reg 0x01 vary by silicon revision and were unreliable.
+  # When USB is present the cell is charging (or topped off); when absent we're
+  # on battery.
+  - platform: template
+    id: axp_charging
+    name: "Charging"
+    # HA-reported only. State is published from the charge-detection interval
+    # (see `interval:`), which also owns is_charging_global + apply_charge_ui —
+    # this template binary_sensor's on_state does NOT fire reliably in this
+    # build, so we do not depend on it for local state/UI.
+
+# ── Text sensors ──────────────────────────────────────────────────────────────
+text_sensor:
+  - platform: homeassistant
+    id: print_status_sensor
+    entity_id: sensor.${printer_id}_print_status
+    on_value:
+      then:
+        - lambda: |-
+            std::string s = x;
+            std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+            bool printing = (s == "running" || s == "prepare");
+            bool paused   = (s.find("pause") != std::string::npos);
+            id(is_printing) = printing;
+            id(is_paused)   = paused;
+            if (!paused) {
+              // Restore solid color when unpausing
+              id(arc_flash_state) = true;
+            }
+        - script.execute: update_arc_color
+        - script.execute: update_home_view
+        - if:
+            condition:
+              lambda: |-
+                std::string s = x;
+                std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+                return (s == "running" || s == "prepare");
+            then:
+              - lvgl.page.show: page_home
+
+  # End-of-print time. HA reports UTC ISO-8601, e.g. "2026-06-09T16:09:00+00:00".
+  # We parse the UTC wall-clock fields, convert to a UTC epoch (civil-days math),
+  # then localtime_r() applies the configured timezone (DST-aware) → "12:09 PM".
+  - platform: homeassistant
+    id: end_time_sensor
+    entity_id: sensor.${printer_id}_end_time
+    on_value:
+      then:
+        - lambda: |-
+            int Y, Mo, D, h, mi;
+            if (sscanf(x.c_str(), "%d-%d-%dT%d:%d", &Y, &Mo, &D, &h, &mi) == 5) {
+              int y = Y; unsigned m = (unsigned)Mo, d = (unsigned)D;
+              y -= (m <= 2);
+              int era = (y >= 0 ? y : y - 399) / 400;
+              unsigned yoe = (unsigned)(y - era * 400);
+              unsigned doy = (153u * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+              unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+              long days = (long)era * 146097 + (long)doe - 719468;   // days since 1970-01-01 UTC
+              time_t epoch = (time_t)days * 86400 + h * 3600 + mi * 60;
+              struct tm lt;
+              localtime_r(&epoch, &lt);
+              int h12 = lt.tm_hour % 12; if (h12 == 0) h12 = 12;
+              char buf[16];
+              snprintf(buf, sizeof(buf), "%d:%02d %s", h12, lt.tm_min, lt.tm_hour < 12 ? "AM" : "PM");
+              id(end_time_str) = buf;
+            } else {
+              id(end_time_str) = "";
+            }
+        - script.execute: render_time_readout
+
+  - platform: homeassistant
+    id: current_stage
+    entity_id: sensor.${printer_id}_current_stage
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: stage_label
+            text: !lambda |-
+              std::string stage = x;
+              if (stage.empty() || stage == "idle" || stage == "Idle") {
+                if (id(print_progress_sensor).has_state() && id(print_progress_sensor).state >= 100) {
+                  return "Cooling";
+                }
+                return "Idle";
+              }
+              // Convert "auto_bed_leveling" -> "Auto Bed Leveling"
+              bool cap = true;
+              for (size_t i = 0; i < stage.length(); i++) {
+                if (cap && isalpha(stage[i])) { stage[i] = toupper(stage[i]); cap = false; }
+                else if (stage[i] == '_') { stage[i] = ' '; cap = true; }
+                else stage[i] = tolower(stage[i]);
+              }
+              return stage.c_str();
+        - lambda: |-
+            // Apple system colors based on state
+            std::string s = x;
+            std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+            uint32_t color;
+            if (s.find("error") != std::string::npos)       color = 0xFF453A;  // sys-red
+            else if (s.find("pause") != std::string::npos)  color = 0xFF9F0A;  // sys-orange
+            else if (s == "printing" || s == "running")     color = 0x30D158;  // sys-green
+            else if (id(print_progress_sensor).has_state() && id(print_progress_sensor).state >= 100)
+                                                            color = 0x0A84FF;  // sys-blue (cooling)
+            else                                            color = 0xBF5AF2;  // sys-purple (other stages)
+            lv_obj_set_style_text_color(id(stage_label), lv_color_hex(color), LV_PART_MAIN);
+
+  - platform: homeassistant
+    id: task_name
+    entity_id: sensor.${printer_id}_task_name
+    # Not displayed in v2 design — kept for HA visibility
+
+  # ── Active tray ───────────────────────────────────────────────────────────
+  - platform: homeassistant
+    id: active_tray_sensor
+    entity_id: sensor.${printer_id}_active_tray
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: active_tray_label
+            text: !lambda |-
+              std::string val = x;
+              if (val.find("Generic ") == 0) val = val.substr(8);
+              if (val.find("Bambu ") == 0) val = val.substr(6);
+              size_t sp = val.find(' ');
+              if (sp != std::string::npos) val = val.substr(0, sp);
+              if (val.empty() || val == "Empty") return "--";
+              for (auto &ch : val) ch = toupper((unsigned char)ch);  // font_active is uppercase-only
+              return val.c_str();
+
+  - platform: homeassistant
+    id: active_tray_color
+    entity_id: sensor.${printer_id}_active_tray
+    attribute: color
+    on_value:
+      then:
+        - lambda: |-
+            std::string c = x;
+            if (c.empty() || c == "unknown") return;
+            if (c[0] == '#') c = c.substr(1);
+            if (c.length() > 6) c = c.substr(0, 6);
+            unsigned long cv = strtoul(c.c_str(), NULL, 16);
+            int r=(cv>>16)&0xFF, g=(cv>>8)&0xFF, b=cv&0xFF;
+            int bright=(r+g+b)/3;
+            lv_obj_set_style_bg_color(id(active_tray_pill), lv_color_hex(cv), LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(id(active_tray_pill), LV_OPA_COVER, LV_PART_MAIN);
+            uint32_t tc = (bright > 180) ? 0x333333 : 0xFFFFFF;
+            lv_obj_set_style_text_color(id(active_tray_label), lv_color_hex(tc), LV_PART_MAIN);
+
+  # ── AMS 2 Pro trays ───────────────────────────────────────────────────────
+  - platform: homeassistant
+    id: ams_tray_1
+    entity_id: sensor.${ams_id}_tray_1
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: ams_slot_1_label
+            text: !lambda |-
+              std::string v = x;
+              if (v.find("Generic ") == 0) v = v.substr(8);
+              if (v.find("Bambu ") == 0) v = v.substr(6);
+              size_t sp = v.find(' ');
+              if (sp != std::string::npos) v = v.substr(0, sp);
+              if (v.empty() || v == "Empty" || v == "empty") return "-";
+              for (auto &ch : v) ch = toupper((unsigned char)ch);  // font_active is uppercase-only
+              return v.c_str();
+
+  - platform: homeassistant
+    id: ams_tray_2
+    entity_id: sensor.${ams_id}_tray_2
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: ams_slot_2_label
+            text: !lambda |-
+              std::string v = x;
+              if (v.find("Generic ") == 0) v = v.substr(8);
+              if (v.find("Bambu ") == 0) v = v.substr(6);
+              size_t sp = v.find(' ');
+              if (sp != std::string::npos) v = v.substr(0, sp);
+              if (v.empty() || v == "Empty" || v == "empty") return "-";
+              for (auto &ch : v) ch = toupper((unsigned char)ch);  // font_active is uppercase-only
+              return v.c_str();
+
+  - platform: homeassistant
+    id: ams_tray_3
+    entity_id: sensor.${ams_id}_tray_3
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: ams_slot_3_label
+            text: !lambda |-
+              std::string v = x;
+              if (v.find("Generic ") == 0) v = v.substr(8);
+              if (v.find("Bambu ") == 0) v = v.substr(6);
+              size_t sp = v.find(' ');
+              if (sp != std::string::npos) v = v.substr(0, sp);
+              if (v.empty() || v == "Empty" || v == "empty") return "-";
+              for (auto &ch : v) ch = toupper((unsigned char)ch);  // font_active is uppercase-only
+              return v.c_str();
+
+  - platform: homeassistant
+    id: ams_tray_4
+    entity_id: sensor.${ams_id}_tray_4
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: ams_slot_4_label
+            text: !lambda |-
+              std::string v = x;
+              if (v.find("Generic ") == 0) v = v.substr(8);
+              if (v.find("Bambu ") == 0) v = v.substr(6);
+              size_t sp = v.find(' ');
+              if (sp != std::string::npos) v = v.substr(0, sp);
+              if (v.empty() || v == "Empty" || v == "empty") return "-";
+              for (auto &ch : v) ch = toupper((unsigned char)ch);  // font_active is uppercase-only
+              return v.c_str();
+
+  - platform: homeassistant
+    id: ams_tray_1_color
+    entity_id: sensor.${ams_id}_tray_1
+    attribute: color
+    on_value:
+      then:
+        - lambda: |-
+            std::string c = x;
+            if (c.empty() || c == "unknown") return;
+            if (c[0] == '#') c = c.substr(1);
+            if (c.length() > 6) c = c.substr(0, 6);
+            unsigned long cv = strtoul(c.c_str(), NULL, 16);
+            int r=(cv>>16)&0xFF, g=(cv>>8)&0xFF, b=cv&0xFF, bright=(r+g+b)/3;
+            lv_obj_set_style_bg_color(id(ams_slot_1_box), lv_color_hex(cv), LV_PART_MAIN);
+            lv_obj_set_style_text_color(id(ams_slot_1_label), lv_color_hex(bright>180?0x333333:0xFFFFFF), LV_PART_MAIN);
+
+  - platform: homeassistant
+    id: ams_tray_2_color
+    entity_id: sensor.${ams_id}_tray_2
+    attribute: color
+    on_value:
+      then:
+        - lambda: |-
+            std::string c = x;
+            if (c.empty() || c == "unknown") return;
+            if (c[0] == '#') c = c.substr(1);
+            if (c.length() > 6) c = c.substr(0, 6);
+            unsigned long cv = strtoul(c.c_str(), NULL, 16);
+            int r=(cv>>16)&0xFF, g=(cv>>8)&0xFF, b=cv&0xFF, bright=(r+g+b)/3;
+            lv_obj_set_style_bg_color(id(ams_slot_2_box), lv_color_hex(cv), LV_PART_MAIN);
+            lv_obj_set_style_text_color(id(ams_slot_2_label), lv_color_hex(bright>180?0x333333:0xFFFFFF), LV_PART_MAIN);
+
+  - platform: homeassistant
+    id: ams_tray_3_color
+    entity_id: sensor.${ams_id}_tray_3
+    attribute: color
+    on_value:
+      then:
+        - lambda: |-
+            std::string c = x;
+            if (c.empty() || c == "unknown") return;
+            if (c[0] == '#') c = c.substr(1);
+            if (c.length() > 6) c = c.substr(0, 6);
+            unsigned long cv = strtoul(c.c_str(), NULL, 16);
+            int r=(cv>>16)&0xFF, g=(cv>>8)&0xFF, b=cv&0xFF, bright=(r+g+b)/3;
+            lv_obj_set_style_bg_color(id(ams_slot_3_box), lv_color_hex(cv), LV_PART_MAIN);
+            lv_obj_set_style_text_color(id(ams_slot_3_label), lv_color_hex(bright>180?0x333333:0xFFFFFF), LV_PART_MAIN);
+
+  - platform: homeassistant
+    id: ams_tray_4_color
+    entity_id: sensor.${ams_id}_tray_4
+    attribute: color
+    on_value:
+      then:
+        - lambda: |-
+            std::string c = x;
+            if (c.empty() || c == "unknown") return;
+            if (c[0] == '#') c = c.substr(1);
+            if (c.length() > 6) c = c.substr(0, 6);
+            unsigned long cv = strtoul(c.c_str(), NULL, 16);
+            int r=(cv>>16)&0xFF, g=(cv>>8)&0xFF, b=cv&0xFF, bright=(r+g+b)/3;
+            lv_obj_set_style_bg_color(id(ams_slot_4_box), lv_color_hex(cv), LV_PART_MAIN);
+            lv_obj_set_style_text_color(id(ams_slot_4_label), lv_color_hex(bright>180?0x333333:0xFFFFFF), LV_PART_MAIN);
+
+  # ── AMS HT tray ───────────────────────────────────────────────────────────
+  - platform: homeassistant
+    id: ams_ht_tray_1
+    entity_id: sensor.${ams_ht_id}_tray_1
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: ams_ht_slot_label
+            text: !lambda |-
+              std::string v = x;
+              if (v.find("Generic ") == 0) v = v.substr(8);
+              if (v.find("Bambu ") == 0) v = v.substr(6);
+              size_t sp = v.find(' ');
+              if (sp != std::string::npos) v = v.substr(0, sp);
+              if (v == "Empty" || v == "empty") return "-";
+              for (auto &ch : v) ch = toupper((unsigned char)ch);  // font_active is uppercase-only
+              return v.c_str();
+
+  - platform: homeassistant
+    id: ams_ht_tray_1_color
+    entity_id: sensor.${ams_ht_id}_tray_1
+    attribute: color
+    on_value:
+      then:
+        - lambda: |-
+            std::string c = x;
+            if (c.empty() || c == "unknown") return;
+            if (c[0] == '#') c = c.substr(1);
+            if (c.length() > 6) c = c.substr(0, 6);
+            unsigned long cv = strtoul(c.c_str(), NULL, 16);
+            int r=(cv>>16)&0xFF, g=(cv>>8)&0xFF, b=cv&0xFF, bright=(r+g+b)/3;
+            lv_obj_set_style_bg_color(id(ams_ht_slot_box), lv_color_hex(cv), LV_PART_MAIN);
+            lv_obj_set_style_text_color(id(ams_ht_slot_label), lv_color_hex(bright>180?0x333333:0xFFFFFF), LV_PART_MAIN);
+
+# ── Button: restart ────────────────────────────────────────────────────────
+button:
+  - platform: restart
+    name: "Restart"
+    id: restart_button
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LVGL v9.5.0 · Studio v2 design — Apple-esque
+# 466×466 · 4 pages: Home (adaptive) · AMS · Camera · Control
+# Activity ring: 300° sweep, 10 o'clock → 2 o'clock, stroke 10px
+# start_angle=120, end_angle=60 (LVGL v9 — correctly applied)
+# ══════════════════════════════════════════════════════════════════════════════
+lvgl:
+  log_level: WARN
+  color_depth: 16
+  bg_color: 0x000000
+  buffer_size: 50%
+  touchscreens:
+    - touchscreen_id: ts_disp1
+  displays:
+    - disp1
+  page_wrap: true
+
+  pages:
+
+    # ════════════════════════════════════════════════════════════════════════
+    # PAGE 1 — HOME (adaptive)
+    # When idle: 9:41 clock face, ambient temps
+    # When printing/paused: % hero, time remaining, stage, 3 temps, tray
+    # ════════════════════════════════════════════════════════════════════════
+    - id: page_home
+      bg_color: 0x000000
+      bg_opa: COVER
+      on_load:
+        - lambda: 'id(cur_page) = 0; id(prev_main) = 0;'
+      widgets:
+
+        # ── Progress arc (always visible) ─────────────────────────────────
+        - arc:
+            id: progress_arc
+            x: 0
+            y: 0
+            width: 466
+            height: 466
+            min_value: 0
+            max_value: 100
+            value: 0
+            start_angle: 120
+            end_angle: 60
+            arc_width: 10
+            arc_color: col_arc_track
+            arc_rounded: true
+            adjustable: false
+            bg_opa: TRANSP
+            border_opa: TRANSP
+            indicator:
+              arc_width: 10
+              arc_color: sys_green
+              arc_rounded: true
+
+        # ── IDLE GROUP (watch face style) ─────────────────────────────────
+        - obj:
+            id: home_idle_group
+            x: 0
+            y: 0
+            width: 466
+            height: 466
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            scrollbar_mode: "OFF"
+            scroll_dir: NONE
+            clickable: false
+            widgets:
+              # Big "9:41" clock — hero (aligns with printing time-remaining)
+              - label:
+                  id: idle_clock_label
+                  x: 33
+                  y: 72
+                  width: 400
+                  text_align: CENTER
+                  text: "9:41"
+                  text_font: font_time_hero
+                  text_color: col_white
+
+              # "FRIDAY · NOV 15" tracked uppercase (aligns with stage)
+              - label:
+                  id: idle_date_label
+                  x: 33
+                  y: 196
+                  width: 400
+                  text_align: CENTER
+                  text: ""
+                  text_font: font_label_t
+                  text_color: col_secondary
+
+              # Printer name label (aligns with layer count)
+              - label:
+                  id: idle_bambu_label
+                  x: 33
+                  y: 232
+                  width: 400
+                  text_align: CENTER
+                  text: "${printer_name}"
+                  text_font: font_med
+                  text_color: col_secondary
+
+              # ── 3 ambient temp complications (same Y as printing) ───
+              - obj:
+                  x: 78
+                  y: 292
+                  width: 108
+                  height: 64
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  clickable: false
+                  widgets:
+                    - label:
+                        x: 0
+                        y: 0
+                        width: 108
+                        text_align: CENTER
+                        text: "LEFT"
+                        text_font: font_comp
+                        text_color: col_tertiary
+                    - label:
+                        id: idle_left_nozzle_label
+                        x: 0
+                        y: 24
+                        width: 108
+                        text_align: CENTER
+                        text: "--"
+                        text_font: font_temp
+                        text_color: col_secondary
+
+              - obj:
+                  x: 179
+                  y: 292
+                  width: 108
+                  height: 64
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  clickable: false
+                  widgets:
+                    - label:
+                        x: 0
+                        y: 0
+                        width: 108
+                        text_align: CENTER
+                        text: "RIGHT"
+                        text_font: font_comp
+                        text_color: col_tertiary
+                    - label:
+                        id: idle_right_nozzle_label
+                        x: 0
+                        y: 24
+                        width: 108
+                        text_align: CENTER
+                        text: "--"
+                        text_font: font_temp
+                        text_color: col_secondary
+
+              - obj:
+                  x: 280
+                  y: 292
+                  width: 108
+                  height: 64
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  clickable: false
+                  widgets:
+                    - label:
+                        x: 0
+                        y: 0
+                        width: 108
+                        text_align: CENTER
+                        text: "BED"
+                        text_font: font_comp
+                        text_color: col_tertiary
+                    - label:
+                        id: idle_bed_temp_label
+                        x: 0
+                        y: 24
+                        width: 108
+                        text_align: CENTER
+                        text: "--"
+                        text_font: font_temp
+                        text_color: col_secondary
+
+              # "Ready" status pill at bottom (aligns with printing tray pill)
+              - obj:
+                  id: idle_ready_pill
+                  x: 168
+                  y: 392
+                  width: 130
+                  height: 38
+                  radius: 19
+                  bg_color: 0x0C3219
+                  bg_opa: COVER
+                  border_width: 0
+                  pad_all: 0
+                  clickable: false
+                  widgets:
+                    - label:
+                        align: CENTER
+                        text_align: CENTER
+                        text: "Ready"
+                        text_font: font_pill
+                        text_color: sys_green
+
+        # ── PRINTING GROUP (modular face) ────────────────────────────────
+        - obj:
+            id: home_printing_group
+            x: 0
+            y: 0
+            width: 466
+            height: 466
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            scrollbar_mode: "OFF"
+            scroll_dir: NONE
+            clickable: false
+            hidden: true
+            widgets:
+              # Small percentage — same size as status text (font_med), white
+              - label:
+                  id: pct_hero_label
+                  x: 33
+                  y: 44
+                  width: 400
+                  text_align: CENTER
+                  text: "0%"
+                  text_font: font_med
+                  text_color: col_secondary
+
+              # Time remaining HERO — big, blue, the focal point
+              - label:
+                  id: time_remaining_label
+                  x: 33
+                  y: 78
+                  width: 400
+                  text_align: CENTER
+                  text: "--"
+                  text_font: font_time_focus
+                  text_color: sys_blue
+
+              # Percent — only shown in end-time view (below the end-time hero).
+              # Matches the normal-view percentage style (font_med / col_secondary).
+              - label:
+                  id: pct_end_label
+                  x: 33
+                  y: 158
+                  width: 400
+                  text_align: CENTER
+                  text: ""
+                  text_font: font_med
+                  text_color: col_secondary
+                  hidden: true
+
+              # Stage label "Printing"
+              - label:
+                  id: stage_label
+                  x: 33
+                  y: 196
+                  width: 400
+                  text_align: CENTER
+                  text: "Printing"
+                  text_font: font_med
+                  text_color: sys_green
+
+              # Layer count "Layer 1 / 62" — bigger font_layer 26pt
+              - label:
+                  id: layer_label
+                  x: 33
+                  y: 236
+                  width: 400
+                  text_align: CENTER
+                  text: "--"
+                  text_font: font_layer
+                  text_color: col_secondary
+
+              # ── 3 temp complications row: LEFT | RIGHT | BED ───────
+              - obj:
+                  x: 78
+                  y: 292
+                  width: 108
+                  height: 64
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  clickable: false
+                  widgets:
+                    - label:
+                        x: 0
+                        y: 0
+                        width: 108
+                        text_align: CENTER
+                        text: "LEFT"
+                        text_font: font_comp
+                        text_color: col_secondary
+                    - label:
+                        id: left_nozzle_label
+                        x: 0
+                        y: 24
+                        width: 108
+                        text_align: CENTER
+                        text: "--"
+                        text_font: font_temp
+                        text_color: col_white
+
+              # RIGHT nozzle complication
+              - obj:
+                  x: 179
+                  y: 292
+                  width: 108
+                  height: 64
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  clickable: false
+                  widgets:
+                    - label:
+                        x: 0
+                        y: 0
+                        width: 108
+                        text_align: CENTER
+                        text: "RIGHT"
+                        text_font: font_comp
+                        text_color: col_secondary
+                    - label:
+                        id: right_nozzle_label
+                        x: 0
+                        y: 24
+                        width: 108
+                        text_align: CENTER
+                        text: "--"
+                        text_font: font_temp
+                        text_color: col_secondary
+
+              # BED complication
+              - obj:
+                  x: 280
+                  y: 292
+                  width: 108
+                  height: 64
+                  bg_opa: TRANSP
+                  border_width: 0
+                  pad_all: 0
+                  clickable: false
+                  widgets:
+                    - label:
+                        x: 0
+                        y: 0
+                        width: 108
+                        text_align: CENTER
+                        text: "BED"
+                        text_font: font_comp
+                        text_color: col_secondary
+                    - label:
+                        id: bed_temp_label
+                        x: 0
+                        y: 24
+                        width: 108
+                        text_align: CENTER
+                        text: "--"
+                        text_font: font_temp
+                        text_color: col_white
+
+              # Active tray pill at bottom — moved down, label centered
+              - obj:
+                  id: active_tray_pill
+                  x: 173
+                  y: 392
+                  width: 120
+                  height: 38
+                  radius: 19
+                  bg_color: 0x303030
+                  bg_opa: COVER
+                  border_width: 0
+                  pad_all: 0
+                  clickable: false
+                  widgets:
+                    - label:
+                        id: active_tray_label
+                        align: CENTER
+                        text_align: CENTER
+                        text: "--"
+                        text_font: font_active
+                        text_color: col_white
+
+
+        # Tap-to-flip zone over the progress readout (hero + percent). Only shown
+        # while printing (toggled by update_home_view). Tapping flips remaining-time
+        # ⇄ end-time; a swipe over it navigates instead (guarded by was_swipe).
+        - obj:
+            id: time_toggle_zone
+            x: 100
+            y: 36
+            width: 266
+            height: 150
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            scrollbar_mode: "OFF"
+            scroll_dir: NONE
+            clickable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !id(was_swipe);'
+                  then:
+                    - lambda: 'id(show_end_time) = !id(show_end_time);'
+                    - script.execute: render_time_readout
+
+
+    # ════════════════════════════════════════════════════════════════════════
+    # PAGE 2 — AMS (combined: AMS 2 Pro + AMS HT)
+    # ════════════════════════════════════════════════════════════════════════
+    - id: page_ams
+      bg_color: 0x000000
+      bg_opa: COVER
+      on_load:
+        - lambda: 'id(cur_page) = 1; id(prev_main) = 1;'
+      widgets:
+
+        # Progress arc — same indicator as home, present on all pages
+        - arc:
+            id: progress_arc_ams
+            x: 0
+            y: 0
+            width: 466
+            height: 466
+            min_value: 0
+            max_value: 100
+            value: 0
+            start_angle: 120
+            end_angle: 60
+            arc_width: 10
+            arc_color: col_arc_track
+            arc_rounded: true
+            adjustable: false
+            bg_opa: TRANSP
+            border_opa: TRANSP
+            indicator:
+              arc_width: 10
+              arc_color: sys_green
+              arc_rounded: true
+
+        # "FILAMENT" header label
+        - label:
+            x: 33
+            y: 56
+            width: 400
+            text_align: CENTER
+            text: "FILAMENT"
+            text_font: font_label_t
+            text_color: col_secondary
+
+        # ── AMS 2 PRO BLOCK ───────────────────────────────────────────────
+        # "AMS 2 Pro" section title — big readable
+        - label:
+            x: 33
+            y: 82
+            width: 400
+            text_align: CENTER
+            text: "AMS 2 Pro"
+            text_font: font_med
+            text_color: col_white
+
+        # AMS 2 Pro environment row — large icons + large values
+        # Container 240w x 38h, centered around x=113
+        - obj:
+            x: 113
+            y: 116
+            width: 240
+            height: 38
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            clickable: false
+            widgets:
+              - label:
+                  x: 0
+                  y: 4
+                  width: 28
+                  text: "\U000F058E"
+                  text_font: icons_md
+                  text_color: sys_teal
+              - label:
+                  id: ams_hum_label
+                  x: 32
+                  y: 0
+                  width: 78
+                  text: "--%"
+                  text_font: font_med
+                  text_color: col_white
+              - obj:
+                  x: 116
+                  y: 8
+                  width: 1
+                  height: 22
+                  bg_color: col_separator
+                  bg_opa: COVER
+                  border_width: 0
+                  pad_all: 0
+                  clickable: false
+              - label:
+                  x: 128
+                  y: 4
+                  width: 28
+                  text: "\U000F1487"
+                  text_font: icons_md
+                  text_color: col_secondary
+              - label:
+                  id: ams_temp_label
+                  x: 160
+                  y: 0
+                  width: 78
+                  text: "--"
+                  text_font: font_med
+                  text_color: col_white
+
+        # AMS 2 Pro 4 tray chips — shorter (54px tall instead of 64) to make room
+        # w=64 h=54 r=12, gap=10, start x=83, y=170
+        - obj:
+            id: ams_slot_1_box
+            x: 83
+            y: 170
+            width: 64
+            height: 54
+            radius: 12
+            bg_color: 0x1a1a1a
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            clickable: false
+            widgets:
+              - label:
+                  id: ams_slot_1_label
+                  align: CENTER
+                  text_align: CENTER
+                  text: ""
+                  text_font: font_active
+                  text_color: col_white
+        - label:
+            x: 83
+            y: 230
+            width: 64
+            text_align: CENTER
+            text: "T1"
+            text_font: font_comp
+            text_color: col_tertiary
+
+        - obj:
+            id: ams_slot_2_box
+            x: 157
+            y: 170
+            width: 64
+            height: 54
+            radius: 12
+            bg_color: 0x1a1a1a
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            clickable: false
+            widgets:
+              - label:
+                  id: ams_slot_2_label
+                  align: CENTER
+                  text_align: CENTER
+                  text: ""
+                  text_font: font_active
+                  text_color: col_white
+        - label:
+            x: 157
+            y: 230
+            width: 64
+            text_align: CENTER
+            text: "T2"
+            text_font: font_comp
+            text_color: col_tertiary
+
+        - obj:
+            id: ams_slot_3_box
+            x: 231
+            y: 170
+            width: 64
+            height: 54
+            radius: 12
+            bg_color: 0x1a1a1a
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            clickable: false
+            widgets:
+              - label:
+                  id: ams_slot_3_label
+                  align: CENTER
+                  text_align: CENTER
+                  text: ""
+                  text_font: font_active
+                  text_color: col_white
+        - label:
+            x: 231
+            y: 230
+            width: 64
+            text_align: CENTER
+            text: "T3"
+            text_font: font_comp
+            text_color: col_tertiary
+
+        - obj:
+            id: ams_slot_4_box
+            x: 305
+            y: 170
+            width: 64
+            height: 54
+            radius: 12
+            bg_color: 0x1a1a1a
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            clickable: false
+            widgets:
+              - label:
+                  id: ams_slot_4_label
+                  align: CENTER
+                  text_align: CENTER
+                  text: ""
+                  text_font: font_active
+                  text_color: col_white
+        - label:
+            x: 305
+            y: 230
+            width: 64
+            text_align: CENTER
+            text: "T4"
+            text_font: font_comp
+            text_color: col_tertiary
+
+        # Hairline separator
+        - obj:
+            x: 120
+            y: 264
+            width: 226
+            height: 1
+            bg_color: col_separator
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            clickable: false
+
+        # ── AMS HT BLOCK ──────────────────────────────────────────────────
+        # "AMS HT" section title — big readable
+        - label:
+            x: 33
+            y: 278
+            width: 400
+            text_align: CENTER
+            text: "AMS HT"
+            text_font: font_med
+            text_color: col_white
+
+        # AMS HT environment row — large
+        - obj:
+            x: 113
+            y: 312
+            width: 240
+            height: 38
+            bg_opa: TRANSP
+            border_width: 0
+            pad_all: 0
+            clickable: false
+            widgets:
+              - label:
+                  x: 0
+                  y: 4
+                  width: 28
+                  text: "\U000F058E"
+                  text_font: icons_md
+                  text_color: sys_teal
+              - label:
+                  id: ams_ht_hum_label
+                  x: 32
+                  y: 0
+                  width: 78
+                  text: "--%"
+                  text_font: font_med
+                  text_color: col_white
+              - obj:
+                  x: 116
+                  y: 8
+                  width: 1
+                  height: 22
+                  bg_color: col_separator
+                  bg_opa: COVER
+                  border_width: 0
+                  pad_all: 0
+                  clickable: false
+              - label:
+                  x: 128
+                  y: 4
+                  width: 28
+                  text: "\U000F1487"
+                  text_font: icons_md
+                  text_color: col_secondary
+              - label:
+                  id: ams_ht_temp_label
+                  x: 160
+                  y: 0
+                  width: 78
+                  text: "--"
+                  text_font: font_med
+                  text_color: col_white
+
+        # AMS HT single tray centered
+        - obj:
+            id: ams_ht_slot_box
+            x: 201
+            y: 362
+            width: 64
+            height: 54
+            radius: 12
+            bg_color: 0x1a1a1a
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            clickable: false
+            widgets:
+              - label:
+                  id: ams_ht_slot_label
+                  align: CENTER
+                  text_align: CENTER
+                  text: ""
+                  text_font: font_active
+                  text_color: col_white
+
+        # (Navigation is by swipe — see touchscreen on_release.)
+
+
+    # ════════════════════════════════════════════════════════════════════════
+    # PAGE — CONTROL CENTER
+    # Battery info · Brightness ±10% · Restart pill
+    # ════════════════════════════════════════════════════════════════════════
+    - id: page_control
+      bg_color: 0x000000
+      bg_opa: COVER
+      skip: true            # reached by swipe-up only, not the L/R carousel
+      on_load:
+        - lambda: 'id(cur_page) = 5;'
+      widgets:
+
+        # Progress arc — same indicator as home, present on all pages
+        - arc:
+            id: progress_arc_ctrl
+            x: 0
+            y: 0
+            width: 466
+            height: 466
+            min_value: 0
+            max_value: 100
+            value: 0
+            start_angle: 120
+            end_angle: 60
+            arc_width: 10
+            arc_color: col_arc_track
+            arc_rounded: true
+            adjustable: false
+            bg_opa: TRANSP
+            border_opa: TRANSP
+            indicator:
+              arc_width: 10
+              arc_color: sys_green
+              arc_rounded: true
+
+        # "BATTERY" header
+        - label:
+            x: 33
+            y: 70
+            width: 400
+            text_align: CENTER
+            text: "BATTERY"
+            text_font: font_label_t
+            text_color: col_secondary
+
+        # Battery % — huge
+        - label:
+            id: batt_pct_label
+            x: 33
+            y: 94
+            width: 400
+            text_align: CENTER
+            text: "--"
+            text_font: font_battery
+            text_color: col_white
+
+        # Bolt icon (shown when charging — hidden by default).
+        # Sized to font_battery (size 64) and y-aligned with batt_pct_label so
+        # it sits inline with the big % value, to its left.
+        - label:
+            id: batt_bolt_icon
+            x: 100
+            y: 94
+            width: 64
+            text: "\U000F0084"
+            text_font: icons_batt
+            text_color: sys_green
+            hidden: true
+
+        # Battery progress bar
+        - bar:
+            id: batt_bar
+            x: 113
+            y: 172
+            width: 240
+            height: 5
+            min_value: 0
+            max_value: 100
+            value: 0
+            bg_color: 0x1a1a1a
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            indicator:
+              bg_color: col_white
+              bg_opa: COVER
+              radius: 3
+
+        # Battery subtitle
+        - label:
+            id: batt_subtitle_label
+            x: 33
+            y: 188
+            width: 400
+            text_align: CENTER
+            text: "On battery"
+            text_font: font_pill
+            text_color: col_tertiary
+
+        # Hairline separator
+        - obj:
+            x: 103
+            y: 224
+            width: 260
+            height: 1
+            bg_color: col_separator
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            clickable: false
+
+        # "BRIGHTNESS" header
+        - label:
+            x: 33
+            y: 242
+            width: 400
+            text_align: CENTER
+            text: "BRIGHTNESS"
+            text_font: font_label_t
+            text_color: col_secondary
+
+        # Brightness value (center, between buttons)
+        - label:
+            id: brightness_label
+            x: 195
+            y: 268
+            width: 76
+            text_align: CENTER
+            text: "80%"
+            text_font: font_brightness
+            text_color: col_white
+
+        # Minus button — left (bigger 72x72, plain ASCII -)
+        - obj:
+            x: 91
+            y: 250
+            width: 72
+            height: 72
+            radius: 36
+            bg_color: 0x1F1F1F
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            clickable: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !id(was_swipe);'
+                  then:
+                    - lambda: |-
+                        id(brightness_pct) -= 10;
+                        if (id(brightness_pct) < 10) id(brightness_pct) = 10;
+                    - script.execute: apply_brightness
+            widgets:
+              - label:
+                  align: CENTER
+                  text_align: CENTER
+                  text: "-"
+                  text_font: font_brightness
+                  text_color: col_white
+
+        # Plus button — right (bigger 72x72)
+        - obj:
+            x: 303
+            y: 250
+            width: 72
+            height: 72
+            radius: 36
+            bg_color: 0x1F1F1F
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            clickable: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !id(was_swipe);'
+                  then:
+                    - lambda: |-
+                        id(brightness_pct) += 10;
+                        if (id(brightness_pct) > 100) id(brightness_pct) = 100;
+                    - script.execute: apply_brightness
+            widgets:
+              - label:
+                  align: CENTER
+                  text_align: CENTER
+                  text: "+"
+                  text_font: font_brightness
+                  text_color: col_white
+
+        # Restart pill at bottom
+        - obj:
+            x: 148
+            y: 356
+            width: 170
+            height: 42
+            radius: 21
+            bg_color: 0x3D1815
+            bg_opa: COVER
+            border_width: 0
+            pad_all: 0
+            clickable: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !id(was_swipe);'
+                  then:
+                    - button.press: restart_button
+            widgets:
+              - label:
+                  align: CENTER
+                  text_align: CENTER
+                  text: "Restart"
+                  text_font: font_pill
+                  text_color: sys_red
+
+        # (Navigation is by swipe — see touchscreen on_release.)
+
+
+    # ════════════════════════════════════════════════════════════════════════
+    # PAGE 5 — SCREENSAVER (flowing dot clusters)
+    # Code-driven: the 10ms interval above creates a recycled pool of LVGL
+    # circle objects (added as children of this page at runtime) and animates
+    # clusters of random-coloured dots that flow out, bounce and fade. Nothing
+    # is declared here but the two nav zones. Tap left/right to leave.
+    # ════════════════════════════════════════════════════════════════════════
+    - id: page_screensaver
+      bg_color: 0x000000
+      bg_opa: COVER
+      skip: true            # reached by swipe-down only, not the L/R carousel
+      on_load:
+        - lambda: 'id(cur_page) = 6;'
+      widgets:
+
+        # Hidden placeholder — forces ESPHome to compile LVGL line support
+        # (LV_USE_LINE) so the screensaver lambda can lv_line_create() its
+        # shooting-star streaks at runtime. Never drawn.
+        - line:
+            hidden: true
+            points:
+              - [0, 0]
+              - [1, 1]
+            line_width: 1
+            line_color: 0xFFFFFF
+
+        # (Navigation is by swipe — see touchscreen on_release. Swipe up = settings,
+        #  swipe left/right = back to the carousel.)

@@ -1,0 +1,14 @@
+# Secrets — never commit
+secrets.yaml
+
+# ESPHome build artifacts
+.esphome/
+*.bin
+
+# Python cache (from the local component)
+__pycache__/
+*.pyc
+
+# OS cruft
+.DS_Store
+Thumbs.db
