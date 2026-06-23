@@ -15,6 +15,9 @@
 #define CST9217_ACK_VALUE 0xAB
 #define CST9217_MAX_TOUCH_POINTS 1
 #define CST9217_DATA_LENGTH (CST9217_MAX_TOUCH_POINTS * 5 + 5)
+// Consecutive unresponsive polls before a hardware reset is attempted.
+// At the 50ms poll interval this is ~2s, long enough to ignore transient glitches.
+#define CST9217_RECOVER_AFTER 40
 
 namespace esphome {
 namespace cst9217 {
@@ -34,10 +37,14 @@ class CST9217Touchscreen : public touchscreen::Touchscreen, public i2c::I2CDevic
 
  protected:
   void reset_device_();
+  bool init_device_();   // reset + re-init sequence; returns true if chip ID matches
   // Internal buffer to read touch data
   uint8_t touch_data_[CST9217_DATA_LENGTH]; // Sufficient for 2 touch points (8 bytes each) + header
   InternalGPIOPin *interrupt_pin_{};
   GPIOPin *reset_pin_{};
+  // Self-heal: count consecutive unresponsive polls; reset the controller once
+  // it has been unresponsive for CST9217_RECOVER_AFTER ticks (~2s @ 50ms).
+  uint16_t fail_count_{0};
   uint16_t chip_id_;
   uint16_t touch_res_x_;
   uint16_t touch_res_y_;
