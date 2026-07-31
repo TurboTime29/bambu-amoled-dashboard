@@ -9,13 +9,38 @@ void CST9217Touchscreen::setup() {
 
   // Reset + initialize the controller. Same sequence is reused by the runtime
   // self-heal in update_touches() if the chip stops responding.
-  if (!this->init_device_()) {
-    ESP_LOGE(TAG, "CST9217 Chip ID mismatch, expected 0x%04X, got 0x%04X", CST9217_CHIP_ID, this->chip_id_);
-    this->status_set_error(LOG_STR("CST9217 Chip ID mismatch"));
-    this->mark_failed();
-    return;
+  //
+  // The touch controller shares a power rail that is NOT cut on an ESP32 soft
+  // reboot (OTA / watchdog / restart button), so after a reboot it can come up
+  // wedged mid-transaction — the chip ID / firmware reads back wrong even though
+  // the chip ACKs on I2C. A cold power-cycle always clears it; a bare reboot may
+  // not. So retry the init a few times before giving up, and — crucially — do
+  // NOT mark_failed() on persistent failure. mark_failed() permanently disables
+  // the component so update_touches() never runs, which means the self-heal
+  // watchdog below can never recover it and touch stays dead until the user
+  // physically power-cycles. Instead we leave the component live and let the
+  // runtime watchdog keep resetting + re-initialising until the chip responds.
+  bool ok = false;
+  for (int attempt = 1; attempt <= 5 && !ok; attempt++) {
+    ok = this->init_device_();
+    if (!ok) {
+      ESP_LOGW(TAG, "CST9217 init attempt %d/5 failed (expected chip 0x%04X, got 0x%04X) — retrying",
+               attempt, CST9217_CHIP_ID, this->chip_id_);
+      vTaskDelay(pdMS_TO_TICKS(30));  // let the controller finish exiting boot mode
+    }
   }
-  ESP_LOGV(TAG, "Chip Type: 0x%04X, ProjectID: 0x%04X", this->chip_id_, this->touch_project_id_);
+
+  if (ok) {
+    ESP_LOGCONFIG(TAG, "CST9217 initialised (chip 0x%04X, project 0x%04X)", this->chip_id_,
+                  this->touch_project_id_);
+  } else {
+    // Not ready yet — stay alive and recover at runtime instead of dying here.
+    // Pre-arm the watchdog so the very first bad poll triggers a reset (~1 poll
+    // interval) rather than waiting the full CST9217_RECOVER_AFTER (~2s) streak.
+    ESP_LOGW(TAG, "CST9217 not ready at boot — will keep resetting + retrying at runtime");
+    this->status_set_warning(LOG_STR("CST9217 not ready"));
+    this->fail_count_ = CST9217_RECOVER_AFTER - 1;
+  }
 
   // Attach an interrupt pin if provided
   if (this->interrupt_pin_ != nullptr) {
@@ -23,9 +48,6 @@ void CST9217Touchscreen::setup() {
     this->attach_interrupt_(this->interrupt_pin_, gpio::INTERRUPT_FALLING_EDGE);
     ESP_LOGV(TAG, "Attached Interrupt Pin: %d", this->interrupt_pin_);
   }
-
-  // At this point we're all good.
-  ESP_LOGV(TAG, "CST9217 Touchscreen initialized successfully");
 }
 
 // Reset the controller and run the register init sequence. Returns true if the
@@ -43,9 +65,13 @@ bool CST9217Touchscreen::init_device_() {
   this->write_register16(ESP_LCD_TOUCH_CST9217_CMD_MODE_REG, cmd_mode, sizeof(cmd_mode));
   vTaskDelay(pdMS_TO_TICKS(10));
 
-  // Read the checkcodes
+  // Read the checkcodes. The high 16 bits are 0xCACA once the controller's
+  // firmware has finished booting; anything else means it came up wedged (the
+  // "chip ACKs but returns garbage frames / ack=0x08" state after a soft reset),
+  // so treat it as not-ready and let the caller reset + retry.
   this->read_register16(ESP_LCD_TOUCH_CST9217_CHECKCODE_REG, data, sizeof(data));
-  ESP_LOGV(TAG, "Checkcode: 0x%02X%02X%02X%02X", data[0], data[1], data[2], data[3]);
+  ESP_LOGV(TAG, "Checkcode: 0x%02X%02X%02X%02X", data[3], data[2], data[1], data[0]);
+  bool firmware_ready = (data[3] == 0xCA && data[2] == 0xCA);
 
   // Get the touchscreen resolution
   this->read_register16(ESP_LCD_TOUCH_CST9217_RESOLUTION_REG, data, sizeof(data));
@@ -62,7 +88,9 @@ bool CST9217Touchscreen::init_device_() {
   this->chip_id_ = (data[3] << 8) | data[2];
   this->touch_project_id_ = (data[1] << 8) | data[0];
 
-  return this->chip_id_ == CST9217_CHIP_ID;
+  // Ready only if BOTH the chip ID matches AND the firmware has booted. Requiring
+  // the checkcode too catches a chip that ACKs on I2C but hasn't finished booting.
+  return firmware_ready && this->chip_id_ == CST9217_CHIP_ID;
 }
 
 void CST9217Touchscreen::dump_config() {
@@ -78,19 +106,38 @@ void CST9217Touchscreen::dump_config() {
 void CST9217Touchscreen::update_touches() {
   uint8_t data[CST9217_DATA_LENGTH] = {0};
 
-  // A poll is "good" only if the I2C read succeeds AND the controller returns
-  // its ACK byte. A failed read or a missing ACK both mean it's unresponsive.
+  // Read the touch report, then immediately ACK it. The CST92xx report protocol
+  // is a handshake: after each read the host MUST write the ACK marker (0xAB)
+  // back to the data register so the controller releases the current frame and
+  // starts building the next one. The original driver only read and never wrote
+  // the ACK back — so after the first frame the controller sat waiting for an
+  // ACK that never came and its data register returned a busy/no-data status
+  // (data[6]=0x08). That read as a "hang", and because a bare reset pin pulse
+  // does not clear it, touch stayed dead until a full power-cycle: the root cause
+  // of the intermittent "touch not working until several restarts" fault.
+  // (Matches Waveshare's reference TouchDrvCST92xx::getPoint handshake.)
   i2c::ErrorCode err = this->read_register16(ESP_LCD_TOUCH_CST9217_DATA_REG, data, sizeof(data));
-  bool ok = (err == i2c::ErrorCode::NO_ERROR) && (data[6] == CST9217_ACK_VALUE);
+  if (err == i2c::ErrorCode::NO_ERROR) {
+    uint8_t ack = CST9217_ACK_VALUE;
+    this->write_register16(ESP_LCD_TOUCH_CST9217_DATA_REG, &ack, 1);
+  }
 
-  if (!ok) {
-    // Log once on the first failure of a streak, then stay quiet to avoid floods.
+  // Only a real I2C failure means the controller is unresponsive. A *successful*
+  // read whose frame marker isn't 0xAB just means "no fresh touch frame this
+  // poll" (idle / all fingers lifted) — that is the normal resting state, NOT a
+  // hang. The original driver conflated the two and treated every idle poll as a
+  // hang, so it pulse-reset the controller every ~2s forever while nothing was
+  // being touched, which is what produced the endless "not responding (ack=0x08)
+  // → hung → resetting" churn. Gate the hang watchdog on the I2C error alone.
+  // (Waveshare's reference getPoint() likewise just returns "no touch" when the
+  // marker is absent, and only logs on an actual bus error.)
+  if (err != i2c::ErrorCode::NO_ERROR) {
     if (this->fail_count_ == 0) {
-      ESP_LOGW(TAG, "CST9217 not responding (i2c err=%d, ack=0x%02X) — watching for hang", (int) err, data[6]);
+      ESP_LOGW(TAG, "CST9217 not responding (i2c err=%d) — watching for hang", (int) err);
     }
     this->fail_count_++;
 
-    // Sustained unresponsiveness (~2s) → the touch controller has hung. Pulse
+    // Sustained I2C failure (~2s) → the controller has genuinely hung. Pulse
     // reset and re-init in place so the panel self-heals without a full reboot.
     if (this->fail_count_ >= CST9217_RECOVER_AFTER) {
       ESP_LOGW(TAG, "CST9217 hung — resetting touch controller");
@@ -101,11 +148,17 @@ void CST9217Touchscreen::update_touches() {
     return;
   }
 
+  // I2C is healthy — clear any prior hang state.
   if (this->fail_count_ != 0) {
     ESP_LOGI(TAG, "CST9217 recovered");
     this->fail_count_ = 0;
   }
   this->status_clear_warning();
+
+  // No fresh report frame → nothing is touching the panel right now. Report an
+  // empty update (lets the touchscreen core fire release events) and stop.
+  if (data[6] != CST9217_ACK_VALUE)
+    return;
 
   ESP_LOGV(TAG, "Touch data dump: %02X %02X %02X %02X %02X %02X %02X %02X",
            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
