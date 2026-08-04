@@ -294,6 +294,17 @@ deep_sleep:
 
 # ── Globals ────────────────────────────────────────────────────────────────
 globals:
+  # Manual horizontal marquee state for the stage/status label (see stage_label
+  # and the current_stage handler). stage_full holds the full formatted status;
+  # stage_pos is the current scroll offset advanced by the marquee interval.
+  - id: stage_full
+    type: std::string
+    restore_value: false
+  - id: stage_pos
+    type: int
+    restore_value: false
+    initial_value: "0"
+
   - id: is_printing
     type: bool
     initial_value: "false"
@@ -583,6 +594,23 @@ script:
 
 # ── Intervals ─────────────────────────────────────────────────────────────────
 interval:
+  # ── Stage/status horizontal marquee ────────────────────────────────────────
+  # Slides a fixed-width window across the full status text so long stage names
+  # scroll sideways on a loop instead of wrapping onto the layer count below.
+  # Only runs when the text is longer than one line's worth; short names stay
+  # static (set by the current_stage handler). One char step per tick.
+  - interval: 300ms
+    then:
+      - lambda: |-
+          const size_t STAGE_MARQUEE_CHARS = 20;
+          const std::string &full = id(stage_full);
+          if (full.length() <= STAGE_MARQUEE_CHARS) return;  // fits — nothing to scroll
+          std::string loop = full + "     ";                 // gap between repetitions
+          size_t period = loop.length();
+          lv_label_set_text(id(stage_label),
+                            (loop + loop).substr(id(stage_pos), STAGE_MARQUEE_CHARS).c_str());
+          id(stage_pos) = (id(stage_pos) + 1) % period;
+
   # Charging detection — poll AXP2101 PMU_STATUS1 (reg 0x00) bit5 (0x20) = VBUS.
   # NOTE: this is driven from an interval rather than the axp_charging template
   # binary_sensor's own lambda, because that lambda was NOT evaluating at boot —
@@ -1352,27 +1380,28 @@ text_sensor:
     entity_id: sensor.${printer_id}_current_stage
     on_value:
       then:
-        - lvgl.label.update:
-            id: stage_label
-            text: !lambda |-
-              std::string stage = x;
-              if (stage.empty() || stage == "idle" || stage == "Idle") {
-                if (id(print_progress_sensor).has_state() && id(print_progress_sensor).state >= 100) {
-                  return "Cooling";
-                }
-                return "Idle";
-              }
+        - lambda: |-
+            // ── Format the raw stage into a Title Case status string ──────────
+            std::string stage = x;
+            if (stage.empty() || stage == "idle" || stage == "Idle") {
+              stage = (id(print_progress_sensor).has_state() && id(print_progress_sensor).state >= 100)
+                        ? "Cooling" : "Idle";
+            } else {
               // Convert "auto_bed_leveling" -> "Auto Bed Leveling"
               bool cap = true;
               for (size_t i = 0; i < stage.length(); i++) {
-                if (cap && isalpha(stage[i])) { stage[i] = toupper(stage[i]); cap = false; }
+                if (cap && isalpha((unsigned char) stage[i])) { stage[i] = toupper(stage[i]); cap = false; }
                 else if (stage[i] == '_') { stage[i] = ' '; cap = true; }
-                else stage[i] = tolower(stage[i]);
+                else stage[i] = tolower((unsigned char) stage[i]);
               }
-              return stage.c_str();
-        - lambda: |-
-            // Apple system colors based on state
-            std::string s = x;
+            }
+
+            // Publish to the marquee state and reset its scroll position.
+            id(stage_full) = stage;
+            id(stage_pos) = 0;
+
+            // ── Apple system colours based on state ──────────────────────────
+            std::string s = stage;
             std::transform(s.begin(), s.end(), s.begin(), ::tolower);
             uint32_t color;
             if (s.find("error") != std::string::npos)       color = 0xFF453A;  // sys-red
@@ -1382,6 +1411,18 @@ text_sensor:
                                                             color = 0x0A84FF;  // sys-blue (cooling)
             else                                            color = 0xBF5AF2;  // sys-purple (other stages)
             lv_obj_set_style_text_color(id(stage_label), lv_color_hex(color), LV_PART_MAIN);
+
+            // ── Initial render: static + centered if it fits, else start the
+            //    left-aligned horizontal marquee (the interval advances it). ──
+            const size_t STAGE_MARQUEE_CHARS = 20;
+            if (stage.length() <= STAGE_MARQUEE_CHARS) {
+              lv_obj_set_style_text_align(id(stage_label), LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+              lv_label_set_text(id(stage_label), stage.c_str());
+            } else {
+              lv_obj_set_style_text_align(id(stage_label), LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+              std::string loop = stage + "     ";
+              lv_label_set_text(id(stage_label), (loop + loop).substr(0, STAGE_MARQUEE_CHARS).c_str());
+            }
 
   - platform: homeassistant
     id: task_name
@@ -1857,7 +1898,12 @@ lvgl:
                   text_color: col_secondary
                   hidden: true
 
-              # Stage label "Printing"
+              # Stage label "Printing". Long stage names (e.g. "Heatbed Surface
+              # Foreign Object Detection") must NOT wrap — a second line collides
+              # with the layer count below. A manual horizontal marquee (see the
+              # current_stage handler + a 300ms interval) feeds this label a
+              # fixed-width sliding window of the text: short names stay centered,
+              # long names scroll sideways on a loop, never wrapping a line.
               - label:
                   id: stage_label
                   x: 33
