@@ -580,12 +580,15 @@ script:
           lv_obj_set_style_bg_color(id(batt_bar), lv_color_hex(color), LV_PART_INDICATOR);
           const char* base;
           if (chg) base = (has && pct >= 100) ? "Charged" : "Charging";
-          else     base = "On battery";
-          char sub[28];
-          if (chg && id(batt_mv) > 0)
-            snprintf(sub, sizeof(sub), "%s (%.2fV)", base, id(batt_mv) / 1000.0f);
-          else
+          else     base = "On Battery";
+          char sub[32];
+          if (id(batt_mv) > 0) {
+            // Charging: "Charging (3.42V)".  On battery: "On Battery - 3.42V".
+            const char* fmt = chg ? "%s (%.2fV)" : "%s - %.2fV";
+            snprintf(sub, sizeof(sub), fmt, base, id(batt_mv) / 1000.0f);
+          } else {
             snprintf(sub, sizeof(sub), "%s", base);
+          }
           lv_label_set_text(id(batt_subtitle_label), sub);
           uint32_t sub_color = chg ? 0x30D158 : 0x595959;
           lv_obj_set_style_text_color(id(batt_subtitle_label), lv_color_hex(sub_color), LV_PART_MAIN);
@@ -2480,7 +2483,7 @@ lvgl:
             y: 188
             width: 400
             text_align: CENTER
-            text: "On battery"
+            text: "On Battery"
             text_font: font_pill
             text_color: col_tertiary
 
