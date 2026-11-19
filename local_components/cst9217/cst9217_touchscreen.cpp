@@ -172,8 +172,20 @@ void CST9217Touchscreen::update_touches() {
     if (status == 0x06) {
       int16_t x = ((p[1] << 4) | (p[3] >> 4));
       int16_t y = ((p[2] << 4) | (p[3] & 0x0F));
-      this->add_raw_touch_position_(i, x, y);
-      ESP_LOGV(TAG, "Point %d: X=%d, Y=%d", i, x, y);
+      // Match a runtime LVGL display rotation. The base-class transform in use
+      // here is mirror_x + mirror_y (a pure 180° rotation), which commutes with
+      // this rotation, so rotating the RAW point by the display angle yields the
+      // correctly rotated final coordinate once the base transform is applied.
+      const int16_t N = (int16_t) this->touch_res_x_;  // square panel (466)
+      int16_t rx = x, ry = y;
+      switch (this->app_rotation_) {
+        case 90:  rx = y;             ry = (N - 1) - x; break;
+        case 180: rx = (N - 1) - x;   ry = (N - 1) - y; break;
+        case 270: rx = (N - 1) - y;   ry = x;           break;
+        default:  break;  // 0
+      }
+      this->add_raw_touch_position_(i, rx, ry);
+      ESP_LOGV(TAG, "Point %d: X=%d, Y=%d (rot %d)", i, rx, ry, this->app_rotation_);
     }
   }
 }

@@ -51,6 +51,23 @@ esphome:
             id(axp2101_dev).write_byte(0x62, (uint8_t)((v.value() & ~0x1F) | 0x10));  // 1000mA
           if (auto v = id(axp2101_dev).read_byte(0x30))
             id(axp2101_dev).write_byte(0x30, (uint8_t)(v.value() | 0x01));            // Vbat ADC on
+      # QMI8658 IMU init (accelerometer only) for screen auto-rotation. If the
+      # chip doesn't answer with its WHO_AM_I (0x05), auto-rotation stays off.
+      - lambda: |-
+          auto who = id(qmi8658_dev).read_byte(0x00);
+          if (who && who.value() == 0x05) {
+            id(qmi8658_dev).write_byte(0x60, 0xB0);   // soft reset
+            delay(20);
+            id(qmi8658_dev).write_byte(0x02, 0x40);   // CTRL1: addr auto-increment, osc on
+            id(qmi8658_dev).write_byte(0x03, 0x05);   // CTRL2: accel +/-2g, ~250Hz ODR
+            id(qmi8658_dev).write_byte(0x08, 0x01);   // CTRL7: enable accelerometer
+            id(imu_ok) = true;
+            ESP_LOGI("imu", "QMI8658 found - screen auto-rotation enabled");
+          } else {
+            id(imu_ok) = false;
+            ESP_LOGW("imu", "QMI8658 not found (WHO_AM_I=0x%02X) - auto-rotation disabled",
+                     who ? who.value() : 0);
+          }
       - script.execute: apply_brightness
       - delay: 30s
       - lambda: |-
@@ -153,6 +170,10 @@ i2c_device:
   - id: axp2101_dev
     i2c_id: bus_a
     address: 0x34
+  # QMI8658 6-axis IMU — accelerometer used for screen auto-rotation.
+  - id: qmi8658_dev
+    i2c_id: bus_a
+    address: 0x6B
 
 spi:
   - id: display_qspi
@@ -304,6 +325,43 @@ globals:
     type: int
     restore_value: false
     initial_value: "0"
+
+  # ── Screen auto-rotation (QMI8658 IMU) ──────────────────────────────────────
+  # The orientation at the first clear upright reading becomes 0°; the UI then
+  # snaps to 90° steps as the device is physically turned. See on_boot (IMU init)
+  # and the rotation interval.
+  - id: imu_ok
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: imu_have_ref
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: imu_ref_angle
+    type: float
+    restore_value: false
+    initial_value: "0"
+  - id: rot_applied_deg
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: rot_cand_deg
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: rot_cand_count
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: rot_target_deg
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: rot_changed
+    type: bool
+    restore_value: false
+    initial_value: "false"
 
   - id: is_printing
     type: bool
@@ -613,6 +671,56 @@ interval:
           lv_label_set_text(id(stage_label),
                             (loop + loop).substr(id(stage_pos), STAGE_MARQUEE_CHARS).c_str());
           id(stage_pos) = (id(stage_pos) + 1) % period;
+
+  # ── Screen auto-rotation from the QMI8658 IMU ───────────────────────────────
+  # The device's tilt direction in the screen plane gives its rotation about the
+  # screen normal. The first clear upright reading is stored as the 0° reference;
+  # thereafter we snap the change to the nearest 90° (debounced over 3 ticks) and
+  # rotate the whole LVGL UI — touch follows via the driver's set_app_rotation().
+  # When laid too flat to have a clear "down" direction, the rotation is held.
+  - interval: 400ms
+    then:
+      - lambda: |-
+          if (!id(imu_ok)) return;
+          auto xl = id(qmi8658_dev).read_byte(0x35);
+          auto xh = id(qmi8658_dev).read_byte(0x36);
+          auto yl = id(qmi8658_dev).read_byte(0x37);
+          auto yh = id(qmi8658_dev).read_byte(0x38);
+          if (!xl || !xh || !yl || !yh) return;
+          int16_t ax = (int16_t)((xh.value() << 8) | xl.value());
+          int16_t ay = (int16_t)((yh.value() << 8) | yl.value());
+          float fx = ax, fy = ay;
+          float mag = sqrtf(fx * fx + fy * fy);
+          if (mag < 6000.0f) return;                 // too flat → hold current rotation
+          float angle = atan2f(fy, fx) * 57.29578f;  // degrees, -180..180
+          if (!id(imu_have_ref)) {                    // first upright reading = 0°
+            id(imu_ref_angle) = angle;
+            id(imu_have_ref) = true;
+            return;
+          }
+          float delta = angle - id(imu_ref_angle);
+          while (delta > 180.0f)  delta -= 360.0f;
+          while (delta < -180.0f) delta += 360.0f;
+          int q = ((int)lroundf(delta / 90.0f) % 4 + 4) % 4;  // quadrant 0..3
+          int target = (q * 90) % 360;                        // 0/90/180/270
+          if (target == id(rot_cand_deg)) id(rot_cand_count)++;
+          else { id(rot_cand_deg) = target; id(rot_cand_count) = 1; }
+          if (id(rot_cand_count) >= 3 && target != id(rot_applied_deg)) {
+            id(rot_applied_deg) = target;
+            id(rot_target_deg) = target;
+            id(rot_changed) = true;
+            ESP_LOGI("imu", "auto-rotate -> %d deg (delta=%.0f)", target, delta);
+          }
+      - if:
+          condition:
+            lambda: 'return id(rot_changed);'
+          then:
+            - lvgl.display.set_rotation: !lambda 'return id(rot_target_deg);'
+            - lambda: |-
+                // Rotate touch coords to match (ESPHome doesn't do this for a
+                // runtime LVGL rotation).
+                id(ts_disp1).set_app_rotation(id(rot_target_deg));
+                id(rot_changed) = false;
 
   # Charging detection — poll AXP2101 PMU_STATUS1 (reg 0x00) bit5 (0x20) = VBUS.
   # NOTE: this is driven from an interval rather than the axp_charging template

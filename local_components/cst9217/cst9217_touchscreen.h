@@ -35,6 +35,11 @@ class CST9217Touchscreen : public touchscreen::Touchscreen, public i2c::I2CDevic
   void set_interrupt_pin(InternalGPIOPin *pin) { this->interrupt_pin_ = pin; }
   void set_reset_pin(GPIOPin *pin) { this->reset_pin_ = pin; }
 
+  // Extra UI rotation (0/90/180/270) applied to touch coordinates so they track
+  // a runtime LVGL display rotation. ESPHome does not rotate touch input for a
+  // rotation applied via lvgl.display.set_rotation, so the driver does it here.
+  void set_app_rotation(int deg) { this->app_rotation_ = ((deg % 360) + 360) % 360; }
+
  protected:
   void reset_device_();
   bool init_device_();   // reset + re-init sequence; returns true if chip ID matches
@@ -45,6 +50,7 @@ class CST9217Touchscreen : public touchscreen::Touchscreen, public i2c::I2CDevic
   // Self-heal: count consecutive unresponsive polls; reset the controller once
   // it has been unresponsive for CST9217_RECOVER_AFTER ticks (~2s @ 50ms).
   uint16_t fail_count_{0};
+  int app_rotation_{0};   // current UI rotation applied to touch coords (0/90/180/270)
   uint16_t chip_id_;
   uint16_t touch_res_x_;
   uint16_t touch_res_y_;
