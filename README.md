@@ -22,6 +22,10 @@ Assistant** and is designed to be OLED-safe (no static burn-in elements).
 - **Settings** — battery (with live charging voltage), brightness, restart.
 - **Screensaver** — twinkling stars + occasional shooting stars, pure motion so
   no pixel stays lit (protects the OLED).
+- **Auto-rotation** — the onboard QMI8658 motion sensor rotates the whole UI
+  (and touch) in 90° steps to match how the device is sitting. Whatever
+  orientation it's in at power-on becomes "upright" (0°); turn it a quarter-turn
+  and the screen follows, debounced so it won't flicker.
 - **Swipe navigation** and AXP2101 battery management (fast-charge tuned).
 
 ## Navigation (all swipe-based)
@@ -40,6 +44,7 @@ Assistant** and is designed to be OLED-safe (no static burn-in elements).
   - Display: CO5300 (QSPI), 466×466 round AMOLED
   - Touch: CST9217 (I²C)
   - PMU: AXP2101 (battery/charging)
+  - IMU: QMI8658 6-axis (screen auto-rotation)
 - A 2.4 GHz Wi-Fi network
 - Optional: a LiPo battery (JST) for cordless use
 - A printed case — see below
